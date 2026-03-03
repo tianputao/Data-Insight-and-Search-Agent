@@ -27,6 +27,9 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Secondary Frontend**: Streamlit standalone app (`app.py`, port 8501) — RAG only
 - **Data Analytics**: Azure Databricks Unity Catalog (SQL Warehouse via JDBC)
 - **Monitoring**: Azure AI Foundry
+- **Agent Skills**: Extend the agent’s capabilities using agent skills, enabling the agent to analyze and search data based on real-world business rules.
+- **Sub Agents**: Adopt a multi-agent architecture, using domain-specific agents to improve efficiency and isolate context.
+- **Unified Data Platform**: Enhance data consistency and data governance, facilitating the construction of an ontology in the future.
 
 ## 🏗️ Architecture
 
