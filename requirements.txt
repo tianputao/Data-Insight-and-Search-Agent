@@ -1,0 +1,55 @@
+# MAF Data Insight Agent — Python Dependencies
+
+# ── Core Framework (Microsoft Agent Framework) ────────────────────────────────
+agent-framework-core==1.0.0b260116
+agent-framework==1.0.0b260116
+# Pin to 0.4.13: version 0.4.14 removed SpanAttributes.LLM_SYSTEM which agent-framework requires
+opentelemetry-semantic-conventions-ai==0.4.13
+
+# ── Azure Services ────────────────────────────────────────────────────────────
+azure-search-documents>=11.4.0
+azure-core>=1.29.0
+azure-identity>=1.15.0
+
+# ── OpenAI (Azure OpenAI) ─────────────────────────────────────────────────────
+openai>=1.12.0
+
+# ── FastAPI backend (replaces Streamlit as primary serving layer) ─────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0           # async HTTP client used by FastAPI test client
+
+# ── Streamlit (kept for standalone RAG-only mode via app.py) ──────────────────
+streamlit>=1.31.0
+
+# ── Environment Management ────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Azure Databricks ─────────────────────────────────────────────────────────
+databricks-sql-connector>=3.0.0    # JDBC-style SQL execution against Databricks warehouse
+databricks-sdk>=0.20.0             # Unity Catalog REST API (table/schema metadata)
+
+# ── Skill Registry ────────────────────────────────────────────────────────────
+python-frontmatter>=1.1.0          # Parse YAML front-matter from SKILL.md files
+
+# ── Data Processing ───────────────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+
+# ── Async Support ─────────────────────────────────────────────────────────────
+aiohttp>=3.9.0
+asyncio>=3.4.3
+nest-asyncio>=1.5.8
+
+# ── Logging and Monitoring ────────────────────────────────────────────────────
+python-json-logger>=2.0.7
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pydantic>=2.5.0
+typing-extensions>=4.9.0
+
+# ── Development Tools (optional) ─────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.12.0
+flake8>=7.0.0
