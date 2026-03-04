@@ -28,6 +28,62 @@ interface MessageWithThinking extends ChatMessage {
   thinkingCollapsed?: boolean;
 }
 
+const normalizeReferenceUrl = (rawUrl: string): string => {
+  if (!rawUrl) return '';
+  let candidate = rawUrl.trim().replace(/^<|>$/g, '').trim();
+  if (!candidate) return '';
+
+  const firstToken = candidate.split(/\s+/)[0]?.trim() || '';
+  candidate = firstToken.replace(/^<|>$/g, '').replace(/[.,;]+$/g, '');
+
+  if (!/^https?:\/\//i.test(candidate)) return '';
+  return candidate;
+};
+
+const isGenericReferenceTitle = (title: string): boolean => {
+  const normalized = (title || '').trim();
+  if (!normalized) return true;
+  if (/^Reference\s+\d+$/i.test(normalized)) return true;
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}(\.pdf)?$/.test(normalized)) return true;
+  if (/^[\w-]+\/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}(\.pdf)?$/.test(normalized)) return true;
+  return false;
+};
+
+const deriveTitleFromUrl = (num: string, title: string, url: string): string => {
+  const normalizedTitle = (title || '').trim();
+  if (normalizedTitle && !isGenericReferenceTitle(normalizedTitle)) {
+    return normalizedTitle;
+  }
+
+  if (url) {
+    try {
+      const pathname = new URL(url).pathname;
+      const fileName = decodeURIComponent(pathname.split('/').pop() || '').trim();
+      if (fileName) return fileName;
+    } catch {
+      // ignore and fallback
+    }
+  }
+
+  return normalizedTitle || `Reference ${num}`;
+};
+
+const referenceGroupKeys = (url: string): string[] => {
+  const cleanUrl = normalizeReferenceUrl(url);
+  if (!cleanUrl) return [];
+
+  try {
+    const parsed = new URL(cleanUrl);
+    const noFragment = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+    const noQueryNoFragment = `${parsed.origin}${parsed.pathname}`;
+    const baseName = decodeURIComponent(parsed.pathname.split('/').pop() || '').trim();
+    const stem = baseName.replace(/\.[^.]+$/, '');
+    return [noFragment, noQueryNoFragment, stem].filter(Boolean);
+  } catch {
+    return [cleanUrl.split('#')[0]];
+  }
+};
+
 const normalizeCitationsForDisplay = (content: string): string => {
   if (!content) return content;
 
@@ -47,8 +103,13 @@ const normalizeCitationsForDisplay = (content: string): string => {
   }
 
   const refsMap = new Map<string, { title: string; url: string }>();
-  for (const m of refsText.matchAll(/\[(\d+)\]\s*\[(.*?)\]\((https?:\/\/[^)]+)\)/g)) {
-    refsMap.set(m[1], { title: (m[2] || '').trim() || `Reference ${m[1]}`, url: m[3].trim() });
+  for (const m of refsText.matchAll(/\[(\d+)\]\s*\[(.*?)\]\(([^)]+)\)/g)) {
+    const num = m[1];
+    const url = normalizeReferenceUrl(m[3]);
+    const title = (m[2] || '').trim();
+    if (url) {
+      refsMap.set(num, { title: deriveTitleFromUrl(num, title, url), url });
+    }
   }
 
   for (const m of refsText.matchAll(/\[(\d+)\]\s+([^\n\[][^\n]*)/g)) {
@@ -58,11 +119,34 @@ const normalizeCitationsForDisplay = (content: string): string => {
     }
   }
 
-  for (const m of body.matchAll(/\[\[(\d+)\]\]\((https?:\/\/[^)]+)\)/g)) {
-    if (!refsMap.has(m[1])) {
-      refsMap.set(m[1], { title: `Reference ${m[1]}`, url: m[2].trim() });
+  for (const m of body.matchAll(/\[\[(\d+)\]\]\(([^)]+)\)/g)) {
+    const num = m[1];
+    const url = normalizeReferenceUrl(m[2]);
+    if (!refsMap.has(num) && url) {
+      refsMap.set(num, { title: deriveTitleFromUrl(num, '', url), url });
     }
   }
+
+  const keyBestTitle = new Map<string, string>();
+  refsMap.forEach((item) => {
+    const normalizedTitle = (item.title || '').trim();
+    if (!normalizedTitle || isGenericReferenceTitle(normalizedTitle)) return;
+    referenceGroupKeys(item.url).forEach((key) => {
+      if (!keyBestTitle.has(key)) keyBestTitle.set(key, normalizedTitle);
+    });
+  });
+
+  refsMap.forEach((item, num) => {
+    const normalizedTitle = (item.title || '').trim();
+    if (normalizedTitle && !isGenericReferenceTitle(normalizedTitle)) return;
+    for (const key of referenceGroupKeys(item.url)) {
+      const better = keyBestTitle.get(key);
+      if (better) {
+        refsMap.set(num, { ...item, title: better });
+        break;
+      }
+    }
+  });
 
   const citedOrder: string[] = [];
   for (const m of body.matchAll(/\[\[(\d+)\]\]/g)) {
@@ -78,9 +162,10 @@ const normalizeCitationsForDisplay = (content: string): string => {
   const remap = new Map<string, string>();
   mergedOrder.forEach((oldNum, idx) => remap.set(oldNum, String(idx + 1)));
 
-  let normalizedBody = body.replace(/\[\[(\d+)\]\]\((https?:\/\/[^)]+)\)/g, (_all, oldNum, url) => {
+  let normalizedBody = body.replace(/\[\[(\d+)\]\]\(([^)]+)\)/g, (_all, oldNum, rawUrl) => {
     const newNum = remap.get(oldNum) || oldNum;
-    return `[[${newNum}]](${url})`;
+    const cleanUrl = normalizeReferenceUrl(rawUrl) || rawUrl;
+    return `[[${newNum}]](${cleanUrl})`;
   });
   normalizedBody = normalizedBody.replace(/\[\[(\d+)\]\]/g, (_all, oldNum) => {
     const newNum = remap.get(oldNum) || oldNum;
@@ -91,10 +176,12 @@ const normalizeCitationsForDisplay = (content: string): string => {
     const item = refsMap.get(oldNum);
     const newNum = remap.get(oldNum) || oldNum;
     if (!item) return '';
-    if (item.url && /^https?:\/\//.test(item.url)) {
-      return `[${newNum}] [${item.title}](${item.url})`;
+    const cleanUrl = normalizeReferenceUrl(item.url);
+    const resolvedTitle = deriveTitleFromUrl(newNum, item.title, cleanUrl);
+    if (cleanUrl && /^https?:\/\//.test(cleanUrl)) {
+      return `[${newNum}] [${resolvedTitle}](${cleanUrl})`;
     }
-    return `[${newNum}] ${item.title}`;
+    return `[${newNum}] ${resolvedTitle}`;
   }).filter(Boolean);
 
   if (refLines.length === 0) {
@@ -388,6 +475,10 @@ function App() {
         } else if (data.type === 'done') {
           if (thinkingFlushTask) {
             await thinkingFlushTask;
+          }
+
+          if (typeof data.content === 'string' && data.content.trim()) {
+            assistantContent = data.content;
           }
 
           assistantContent = normalizeCitationsForDisplay(assistantContent);

@@ -56,8 +56,9 @@ class AzureSearchConfig:
     DESCRIPTION_FIELD = os.getenv('AZURE_SEARCH_DESCRIPTION_FIELD', 'description')
     
     # Document access configuration
-    BASE_URL = os.getenv('AZURE_BLOB_BASE_URL', '')  # Base URL for blob storage
-    SAS_TOKEN = os.getenv('AZURE_BLOB_SAS_TOKEN', '')  # SAS token for blob access
+    # Prefer AZURE_* names, but keep backward compatibility with legacy BASE_URL/SAS_TOKEN.
+    BASE_URL = os.getenv('AZURE_BLOB_BASE_URL') or os.getenv('BASE_URL', '')
+    SAS_TOKEN = os.getenv('AZURE_BLOB_SAS_TOKEN') or os.getenv('SAS_TOKEN', '')
     
     # Image configuration
     IMAGE_BASE_URL = os.getenv('AZURE_IMAGE_BASE_URL', '')  # Base URL for image storage
@@ -67,9 +68,6 @@ class AzureSearchConfig:
     VECTOR_FIELD = os.getenv('AZURE_SEARCH_VECTOR_FIELD', 'contentVector')
     METADATA_VECTOR_FIELD = os.getenv('AZURE_SEARCH_METADATA_VECTOR_FIELD', 'full_metadata_vector')
 
-    # Citation Configuration
-    BASE_URL = os.getenv('BASE_URL')
-    SAS_TOKEN = os.getenv('SAS_TOKEN')
     VECTOR_DIMENSIONS = int(os.getenv('AZURE_SEARCH_VECTOR_DIMENSIONS', '3072'))
     
     # Document metadata fields

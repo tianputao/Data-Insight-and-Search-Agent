@@ -4,6 +4,7 @@ Provides hybrid search (vector + keyword), semantic reranking, and agentic retri
 """
 
 import asyncio
+import re
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
@@ -104,6 +105,12 @@ class AzureAISearchTool:
         - Preserves existing query params and URL fragment
         - Adds only missing SAS keys
         - Uses IMAGE_SAS_TOKEN for image links, SAS_TOKEN for document links
+
+        IMPORTANT: The SAS token is appended as a raw query string rather than being
+        decoded through parse_qsl / urlencode.  The round-trip decode-then-encode can
+        silently corrupt the 'sig' field because urllib.parse.parse_qsl treats '+' as
+        a space (HTML form-data convention), which changes the base64 signature and
+        causes Azure to return AuthenticationFailed / 'Signature not well formed'.
         """
         if not url:
             return url
@@ -117,15 +124,18 @@ class AzureAISearchTool:
             return clean_url
 
         parsed = urlsplit(clean_url)
-        existing_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        token_params = dict(parse_qsl(token, keep_blank_values=True))
+
+        # Inspect existing keys only (safe — we never decode values).
+        existing_keys = {k.lower() for k, _ in parse_qsl(parsed.query, keep_blank_values=True)}
 
         # If URL already has a SAS signature, keep it as-is
-        if "sig" in existing_params:
+        if "sig" in existing_keys:
             return clean_url
 
-        merged = {**existing_params, **token_params}
-        new_query = urlencode(merged, doseq=True)
+        # Append the raw token verbatim — no decode/re-encode cycle.
+        token_clean = token.lstrip("?&")
+        sep = "&" if parsed.query else ""
+        new_query = parsed.query + sep + token_clean
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
     def _extract_page_number(self, result: Dict[str, Any]) -> Optional[int]:
@@ -146,15 +156,60 @@ class AzureAISearchTool:
             return url
         return f"{url}#page={page}"
 
+    def _build_document_url_from_base(self, base_url: str, filepath: str) -> str:
+        """
+        Build a stable blob URL from configured BASE_URL + indexed filepath.
+
+        Handles overlap between BASE_URL path suffix and filepath prefix to avoid
+        duplicated segments such as:
+        .../aisearchdoc/ai_search_regulation_doc/ai_search_regulation_doc/xxx.pdf
+        """
+        parsed_base = urlsplit(base_url.strip().rstrip('/'))
+        base_segments = [seg for seg in parsed_base.path.split('/') if seg]
+
+        normalized_path = filepath.replace('\\', '/').lstrip('/')
+        file_segments = [seg for seg in normalized_path.split('/') if seg]
+
+        overlap = 0
+        max_overlap = min(len(base_segments), len(file_segments))
+        for k in range(max_overlap, 0, -1):
+            if base_segments[-k:] == file_segments[:k]:
+                overlap = k
+                break
+
+        merged_segments = base_segments + file_segments[overlap:]
+        merged_path = '/' + '/'.join(quote(seg, safe='') for seg in merged_segments)
+        return urlunsplit((parsed_base.scheme, parsed_base.netloc, merged_path, '', ''))
+
     def _resolve_result_title(self, result: Dict[str, Any]) -> str:
         """Resolve a stable, non-empty title for citations/references."""
+        def _is_placeholder_title(raw: Optional[str]) -> bool:
+            if not raw:
+                return True
+            normalized = str(raw).strip()
+            if not normalized:
+                return True
+
+            if re.fullmatch(r"Reference\s+\d+", normalized, flags=re.I):
+                return True
+
+            # UUID-like filename/id placeholders
+            if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}(\.pdf)?", normalized):
+                return True
+
+            # Path-like placeholder from index chunks, e.g. ai_search_regulation_doc/<uuid>
+            if re.fullmatch(r"[\w\-]+/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}(\.pdf)?", normalized):
+                return True
+
+            return False
+
         title = result.get(self.field_config["title_field"])
-        if isinstance(title, str) and title.strip():
+        if isinstance(title, str) and title.strip() and not _is_placeholder_title(title):
             return title.strip()
 
         for key in (
-            self.field_config.get("sub_title_field"),
             self.field_config.get("main_title_field"),
+            self.field_config.get("sub_title_field"),
             self.field_config.get("h1_field"),
             self.field_config.get("h2_field"),
             self.field_config.get("h3_field"),
@@ -164,8 +219,12 @@ class AzureAISearchTool:
             if not key:
                 continue
             value = result.get(key)
-            if isinstance(value, str) and value.strip():
+            if isinstance(value, str) and value.strip() and not _is_placeholder_title(value):
                 return value.strip()
+
+        # Fall back to original title field even if it looks like an id/path.
+        if isinstance(title, str) and title.strip():
+            return title.strip()
 
         rid = result.get(self.field_config["id_field"])
         return f"Document {rid}" if rid else "Untitled"
@@ -342,10 +401,8 @@ class AzureAISearchTool:
                 # Construct citation URL
                 citation_url = self._ensure_blob_sas_url(raw_url, is_image=False)
                 if AzureSearchConfig.BASE_URL and filepath:
-                    base = AzureSearchConfig.BASE_URL.rstrip('/')
-                    path = filepath.replace('\\', '/').lstrip('/')  # Ensure forward slashes for URL
-                    encoded_path = quote(path, safe='/')  # URL encode the path
-                    citation_url = self._ensure_blob_sas_url(f"{base}/{encoded_path}", is_image=False)
+                    built = self._build_document_url_from_base(AzureSearchConfig.BASE_URL, filepath)
+                    citation_url = self._ensure_blob_sas_url(built, is_image=False)
                 else:
                     if not filepath:
                         logger.warning(
@@ -510,10 +567,8 @@ class AzureAISearchTool:
 
                 citation_url = self._ensure_blob_sas_url(raw_url, is_image=False)
                 if AzureSearchConfig.BASE_URL and filepath:
-                    base = AzureSearchConfig.BASE_URL.rstrip('/')
-                    path = filepath.replace('\\', '/').lstrip('/')
-                    encoded_path = quote(path, safe='/')
-                    citation_url = self._ensure_blob_sas_url(f"{base}/{encoded_path}", is_image=False)
+                    built = self._build_document_url_from_base(AzureSearchConfig.BASE_URL, filepath)
+                    citation_url = self._ensure_blob_sas_url(built, is_image=False)
                 else:
                     if not filepath:
                         logger.warning(

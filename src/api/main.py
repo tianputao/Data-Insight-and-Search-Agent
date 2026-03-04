@@ -35,7 +35,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -158,7 +158,14 @@ def _sse(data: dict) -> str:
 
 
 def _ensure_blob_sas_url(url: str, is_image: bool = False) -> str:
-    """Ensure a blob storage URL carries SAS params for private storage accounts."""
+    """Ensure a blob storage URL carries SAS params for private storage accounts.
+
+    IMPORTANT: The SAS token is appended as a raw query string rather than being
+    decoded through parse_qsl / urlencode.  The round-trip decode-then-encode can
+    silently corrupt the 'sig' field because urllib.parse.parse_qsl treats '+' as
+    a space (HTML form-data convention), which changes the base64 signature and
+    causes Azure to return AuthenticationFailed / 'Signature not well formed'.
+    """
     if not url or "blob.core.windows.net" not in url:
         return url
 
@@ -167,15 +174,18 @@ def _ensure_blob_sas_url(url: str, is_image: bool = False) -> str:
         return url
 
     parsed = urlsplit(url.strip().replace("<", "").replace(">", ""))
-    existing_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
 
-    # URL already signed
-    if "sig" in existing_params:
+    # Check for existing SAS signature using decoded key names (safe — we only
+    # inspect keys, not values).
+    existing_keys = {k.lower() for k, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    if "sig" in existing_keys:
         return url
 
-    token_params = dict(parse_qsl(token, keep_blank_values=True))
-    merged = {**existing_params, **token_params}
-    new_query = urlencode(merged, doseq=True)
+    # Append the raw token string verbatim — NO decode / re-encode cycle — so the
+    # sig value is never mangled.
+    token_clean = token.lstrip("?&")
+    sep = "&" if parsed.query else ""
+    new_query = parsed.query + sep + token_clean
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
 
@@ -236,15 +246,96 @@ def _extract_search_references(result_text: str) -> Dict[str, tuple[str, str]]:
     return refs
 
 
+def _clean_reference_url(raw_url: str) -> str:
+    """Normalize a markdown reference URL and strip optional title suffix."""
+    if not raw_url:
+        return ""
+
+    candidate = str(raw_url).strip()
+    if not candidate:
+        return ""
+
+    candidate = candidate.strip("<>").strip()
+
+    # Markdown destination may contain optional title text: (url "title")
+    if " " in candidate:
+        candidate = candidate.split()[0].strip()
+
+    candidate = candidate.rstrip(".,;")
+
+    if not re.match(r"^https?://", candidate, flags=re.I):
+        return ""
+
+    return candidate
+
+
+def _derive_reference_title(num: str, title: str, url: str) -> str:
+    """Prefer explicit titles; otherwise infer from URL basename."""
+    normalized = (title or "").strip()
+    if normalized and not _is_generic_reference_title(normalized):
+        return normalized
+
+    cleaned_url = _clean_reference_url(url)
+    if cleaned_url:
+        parsed = urlsplit(cleaned_url)
+        basename = parsed.path.rsplit("/", 1)[-1].strip()
+        if basename:
+            return unquote(basename)
+
+    return f"Reference {num}"
+
+
 def _extract_explicit_references_block(refs_text: str) -> Dict[str, tuple[str, str]]:
     """Parse an existing References block into {num: (title, url)}."""
     refs: Dict[str, tuple[str, str]] = {}
-    for m in re.finditer(r"\[(\d+)\]\s*\[(.*?)\]\((https?://[^)]+)\)", refs_text, re.S):
-        refs[m.group(1)] = (m.group(2).strip() or f"Reference {m.group(1)}", m.group(3).strip())
 
-    for m in re.finditer(r"\[(\d+)\]\s*[:：]\s*(https?://\S+)", refs_text, re.S):
-        refs.setdefault(m.group(1), (f"Reference {m.group(1)}", m.group(2).strip()))
+    # ── Pattern 1: consolidated range  [1]–[N] title\nurl  ───────────────────
+    # The LLM sometimes collapses identical-document citations into one entry like:
+    #   [1]–[8] GB/T 31485-2015 document title
+    #   https://storage.blob.core.windows.net/...
+    for m in re.finditer(
+        r"\[(\d+)\][–—-]+\[(\d+)\]\s+([^\n]+?)\s*\n\s*(https?://\S+)",
+        refs_text,
+    ):
+        start_num = int(m.group(1))
+        end_num = int(m.group(2))
+        title = m.group(3).strip()
+        url = _clean_reference_url(m.group(4))
+        if url:
+            for n in range(start_num, end_num + 1):
+                num_str = str(n)
+                refs.setdefault(num_str, (_derive_reference_title(num_str, title, url), url))
 
+    # Also handle consolidated range where URL is on same line after title
+    for m in re.finditer(
+        r"\[(\d+)\][–—-]+\[(\d+)\]\s+(.*?)\s+(https?://\S+)",
+        refs_text,
+    ):
+        start_num = int(m.group(1))
+        end_num = int(m.group(2))
+        title = m.group(3).strip()
+        url = _clean_reference_url(m.group(4))
+        if url:
+            for n in range(start_num, end_num + 1):
+                num_str = str(n)
+                refs.setdefault(num_str, (_derive_reference_title(num_str, title, url), url))
+
+    # ── Pattern 2: standard markdown link  [N] [title](url)  ────────────────
+    for m in re.finditer(r"\[(\d+)\]\s*\[(.*?)\]\(([^)]+)\)", refs_text, re.S):
+        num = m.group(1)
+        title = (m.group(2) or "").strip()
+        url = _clean_reference_url(m.group(3))
+        if url:
+            refs.setdefault(num, (_derive_reference_title(num, title, url), url))
+
+    # ── Pattern 3: bare URL  [N]: url  or  [N] url  ─────────────────────────
+    for m in re.finditer(r"\[(\d+)\]\s*[:：]?\s*(https?://\S+)", refs_text, re.S):
+        num = m.group(1)
+        url = _clean_reference_url(m.group(2))
+        if url:
+            refs.setdefault(num, (_derive_reference_title(num, "", url), url))
+
+    # ── Pattern 4: plain-text title  [N] text (no URL)  ─────────────────────
     for m in re.finditer(r"\[(\d+)\]\s+([^\n\[][^\n]*)", refs_text):
         num = m.group(1)
         title = m.group(2).strip()
@@ -257,9 +348,11 @@ def _extract_explicit_references_block(refs_text: str) -> Dict[str, tuple[str, s
 def _extract_inline_citation_links(body: str) -> Dict[str, tuple[str, str]]:
     """Extract inline citation links like [[3]](url) from answer body."""
     refs: Dict[str, tuple[str, str]] = {}
-    for m in re.finditer(r"\[\[(\d+)\]\]\((https?://[^)]+)\)", body):
+    for m in re.finditer(r"\[\[(\d+)\]\]\(([^)]+)\)", body):
         n = m.group(1)
-        refs[n] = (f"Reference {n}", m.group(2).strip())
+        url = _clean_reference_url(m.group(2))
+        if url:
+            refs[n] = (_derive_reference_title(n, "", url), url)
     return refs
 
 
@@ -292,7 +385,21 @@ def _extract_search_references_from_payload(payload: Any) -> Dict[str, tuple[str
 def _is_generic_reference_title(title: str) -> bool:
     if not title:
         return True
-    return bool(re.fullmatch(r"Reference\s+\d+", title.strip(), flags=re.I))
+    normalized = title.strip()
+
+    # Explicit placeholder titles
+    if re.fullmatch(r"Reference\s+\d+", normalized, flags=re.I):
+        return True
+
+    # UUID-like filenames / ids, e.g. 2ff6f160-6a7c-45e5-a037-79c174eb4488.pdf
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\.pdf", normalized):
+        return True
+
+    # Indexed path-like placeholders, e.g. ai_search_regulation_doc/2ff6f160-...
+    if re.fullmatch(r"[\w\-]+/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}", normalized):
+        return True
+
+    return False
 
 
 def _merge_references(
@@ -336,7 +443,72 @@ def _split_body_and_refs(text: str) -> tuple[str, str]:
         idx = implicit.start()
         return text[:idx], text[idx:]
 
+    # Also detect plain-URL reference lists: [1] https://...
+    implicit2 = re.search(r"\n\s*\[(\d+)\]\s+https?://\S", text, re.S)
+    if implicit2:
+        idx = implicit2.start()
+        return text[:idx], text[idx:]
+
     return text, ""
+
+
+def _propagate_titles_by_url(
+    refs_map: Dict[str, tuple[str, str]],
+) -> Dict[str, tuple[str, str]]:
+    """
+    When several citation numbers share the same URL (or same URL with different
+    #page=N anchors, i.e. different pages of the same document), make sure they all
+    inherit the best (most descriptive) title instead of each keeping whatever title
+    fragment happened to be parsed first.
+    """
+
+    def _doc_group_keys(url: str) -> List[str]:
+        """Generate grouping keys so near-equivalent doc URLs share title context."""
+        if not url:
+            return []
+
+        cleaned = _clean_reference_url(url)
+        if not cleaned:
+            return []
+
+        parsed = urlsplit(cleaned)
+        path = parsed.path or ""
+        base_url = urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+        no_query_no_fragment = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+        basename = path.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0] if basename else ""
+
+        keys = [base_url, no_query_no_fragment]
+        if stem:
+            keys.append(stem)
+        return keys
+
+    # Build key → best_title mapping
+    key_best_title: Dict[str, str] = {}
+    for num, (title, url) in refs_map.items():
+        if not url:
+            continue
+        if not title or _is_generic_reference_title(title):
+            continue
+        for key in _doc_group_keys(url):
+            existing = key_best_title.get(key, "")
+            if not existing or _is_generic_reference_title(existing):
+                key_best_title[key] = title
+
+    # Fill in any still-generic or empty title from the best available
+    result: Dict[str, tuple[str, str]] = {}
+    for num, (title, url) in refs_map.items():
+        if url and (_is_generic_reference_title(title) or not title):
+            better = ""
+            for key in _doc_group_keys(url):
+                better = key_best_title.get(key, "")
+                if better:
+                    break
+            if better:
+                title = better
+        result[num] = (title, url)
+    return result
 
 
 def _normalize_citations_and_references(
@@ -364,6 +536,9 @@ def _normalize_citations_and_references(
 
     remap = {old: str(i + 1) for i, old in enumerate(ordered_old)}
 
+    # Propagate best titles across citations sharing the same document URL.
+    refs_map = _propagate_titles_by_url(refs_map)
+
     # Rewrite [[old]] to [[new]] for consistent numbering.
     if cited_markers:
         body = re.sub(r"\[\[(\d+)\]\]", lambda m: f"[[{remap.get(m.group(1), m.group(1))}]]", body)
@@ -377,10 +552,12 @@ def _normalize_citations_and_references(
             continue
         new_num = remap[old]
         title, url = refs_map[old]
-        if url and re.match(r"^https?://", url):
-            ref_lines.append(f"[{new_num}] [{title}]({url})")
+        cleaned_url = _clean_reference_url(url)
+        resolved_title = _derive_reference_title(new_num, title, cleaned_url)
+        if cleaned_url and re.match(r"^https?://", cleaned_url):
+            ref_lines.append(f"[{new_num}] [{resolved_title}]({cleaned_url})")
         else:
-            ref_lines.append(f"[{new_num}] {title}")
+            ref_lines.append(f"[{new_num}] {resolved_title}")
 
     return body, ref_lines
 
@@ -626,7 +803,7 @@ async def _stream_agent_response(
 
     _append_history(thread_id, message, full_response)
 
-    yield _sse({"type": "done"})
+    yield _sse({"type": "done", "content": full_response})
 
 
 
