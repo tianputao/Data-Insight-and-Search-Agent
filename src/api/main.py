@@ -521,6 +521,14 @@ def _normalize_citations_and_references(
     """
     cited_markers = re.findall(r"\[\[(\d+)\]\]", body)
 
+    # English answers sometimes use [n] instead of [[n]]. Normalize it so the
+    # existing citation remap path can handle both styles consistently.
+    if not cited_markers:
+        single_style_markers = re.findall(r"(?<!\[)\[(\d+)\](?!\])", body)
+        if single_style_markers:
+            body = re.sub(r"(?<!\[)\[(\d+)\](?!\])", r"[[\1]]", body)
+            cited_markers = single_style_markers
+
     if cited_markers:
         ordered_old: List[str] = []
         seen = set()
@@ -539,12 +547,21 @@ def _normalize_citations_and_references(
     # Propagate best titles across citations sharing the same document URL.
     refs_map = _propagate_titles_by_url(refs_map)
 
-    # Rewrite [[old]] to [[new]] for consistent numbering.
+    # Rewrite existing inline markers to keep numbering consistent.
     if cited_markers:
         body = re.sub(r"\[\[(\d+)\]\]", lambda m: f"[[{remap.get(m.group(1), m.group(1))}]]", body)
     else:
-        synthesized_markers = " ".join(f"[[{remap[old]}]]" for old in ordered_old)
-        body = body.rstrip() + f"\n\n参考依据：{synthesized_markers}"
+        # Model omitted inline markers (common for English answers).
+        # Inject clickable [[n]](url) markers at the end of the body so the reader
+        # can see and click the source links. Only inject refs that have a real URL.
+        marker_parts = []
+        for i, old in enumerate(ordered_old):
+            _, u = refs_map.get(old, ("", ""))
+            cleaned = _clean_reference_url(u)
+            if cleaned and re.match(r"^https?://", cleaned):
+                marker_parts.append(f"[[{i + 1}]]({cleaned})")
+        if marker_parts:
+            body = body.rstrip() + "\n\n" + " ".join(marker_parts)
 
     ref_lines: List[str] = []
     for old in ordered_old:

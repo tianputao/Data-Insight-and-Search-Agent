@@ -1,6 +1,6 @@
 ---
 name: metadata-mapping
-description: Maps Azure Databricks Unity Catalog technical column names to business terms and semantic definitions for the agents data domain. Enrich, suppsupplement and clarify the table information that did not provided. the question related to the data analytics, data query, schema search and data domain context, use this skill to improve accuracy and relevance of SQL generation by providing clear mappings and explanations of the underlying data. 
+description: Maps Azure Databricks Unity Catalog technical column names to business terms and semantic definitions for the agents data domain. Enrich, suppsupplement and clarify the table information that did not provided. the question related to the data analytics, data query, schema query and data domain context, use this skill to improve accuracy and relevance of SQL generation by providing clear mappings and explanations of the underlying data. 
 ---
 
 # metadata-mapping
@@ -38,8 +38,8 @@ description: Maps Azure Databricks Unity Catalog technical column names to busin
 
 - **Understanding column semantics** — "what does `UnitPriceDiscount` mean?"
 - **Translating user questions** — "which column in the table can represent the customer name (buyer)?"
-- **Enriching LLM context** before DataInsightAgent and MetaDataAgent generates SQL.
-- **cannot be find the data directly** find data in silver schema if you can't find the data in gold schema, and use the metadata mapping to understand the data meaning and structure.
+- **Enriching LLM context**: before DataInsightAgent and MetaDataAgent generates SQL.
+- **cannot be find the data directly**: find data in silver schema if you can't find the data in gold schema, and use the metadata mapping to understand the data meaning and structure.
 
 ## When to Fetch Full Page
 
