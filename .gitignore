@@ -60,3 +60,5 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+/anthropic-ai-claude-code-2.1.88-restored/
