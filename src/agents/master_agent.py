@@ -612,8 +612,7 @@ Sub-questions:"""
             if not result:
                 return "DataInsightAgent returned no results."
 
-            brief = result[:300].replace("\n", " ")
-            return f"[STREAMED] DataInsightAgent has completed analysis and streamed results to the user. Brief: {brief}…"
+            return "[STREAMED] DataInsightAgent has completed analysis and streamed the full result to the user."
 
         return [decompose_query, search_multiple_queries, search_knowledge, delegate_metadata, delegate_data_insight]
 

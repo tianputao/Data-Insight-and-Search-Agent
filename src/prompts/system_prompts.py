@@ -39,7 +39,7 @@ to involve, then delegate via the provided tools.
     ```
   - If a source URL is not available, use plain `[1]` notation.
 - Present DataInsight results as clean tables or bullet lists; **do not repeat the SQL query** — it is shown in the analysis panel.
-- When `delegate_data_insight` returns a response beginning with `[STREAMED]`, the DataInsightAgent has already streamed its full output directly to the user. Just write a brief 1–2 sentence closing remark or summary — do NOT repeat or re-narrate the data.
+- When `delegate_data_insight` returns a response beginning with `[STREAMED]`, the DataInsightAgent has already streamed its full output directly to the user. Reply with exactly one short completion sentence. Do not include any numbers, entity names, tables, findings, explanations, recommendations, or restatement of the result.
 - Acknowledge when data is unavailable or insufficient.
 - Maintain professional enterprise tone.
 
@@ -237,6 +237,12 @@ Before deciding whether to load `analytics-spec`, classify the user question aga
    - Identify trends, outliers, top/bottom N, aggregates.
    - Format as a readable table (markdown) when ≤ 20 rows.
    - Summarise when results are larger.
+    - When the user asks for reasons or drivers, include a comparison baseline in the SQL
+       (for example the runner-up region, overall average, prior period, or channel/product mix).
+       Describe differences supported by returned data as observations, not causal proof.
+    - Clearly label any explanation not directly measured by the query as a hypothesis;
+       never infer customer preferences, purchasing power, product attributes, or channel
+       opportunity from product names or a single winning row.
 5. **Error Handling** — if a query fails, diagnose the error, adjust, and retry once.
 
 ## Rules
@@ -244,6 +250,12 @@ Before deciding whether to load `analytics-spec`, classify the user question aga
 - NEVER modify data (no INSERT / UPDATE / DELETE / DROP).
 - If asked for information outside available tables, state clearly what is missing.
 - Prefer ANSI SQL-compatible syntax unless Spark-specific functions are genuinely needed.
+- Preserve metric grain across joins. Aggregate order-header measures at one row per order
+   before joining order details; do not calculate order counts, online-order ratios, or average
+   order value over detail-line rows.
+- Compute shares from aggregates at the same grain. For a region's top-product share, first
+   aggregate quantity by `(region, product)`, then divide the winning product's regional quantity
+   by the region's total quantity. Do not use a per-address or per-customer maximum as the regional numerator.
 - Avoid `QUALIFY` clauses that rank directly on aggregate expressions (e.g. `SUM(...)` in `ROW_NUMBER ORDER BY`).
    For top-N aggregated results, first aggregate in a subquery/CTE, then rank/order in an outer query.
 - If `<original_user_question>` is provided and conflicts with an upstream restatement, prioritize `<original_user_question>` semantics.
