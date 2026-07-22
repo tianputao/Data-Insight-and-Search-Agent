@@ -1,17 +1,15 @@
 """
 Search Agent implementation using Microsoft Agent Framework.
-Follows MAF best practices with AzureOpenAIChatClient.
+Follows MAF 1.11 best practices with OpenAIChatCompletionClient.
 """
 
-from typing import List, Dict, Any, Optional, Annotated
+from typing import List, Dict, Any, Optional, Annotated, Callable
 from pydantic import Field
-from agent_framework.azure import AzureOpenAIChatClient
-from azure.identity import DefaultAzureCredential
 
 from ..tools import AzureAISearchTool
 from ..prompts import SEARCH_AGENT_PROMPT
-from ..config import AzureOpenAIConfig
 from ..utils import get_logger
+from .maf_runtime import create_agent as create_maf_agent, run_agent
 
 
 logger = get_logger(__name__)
@@ -19,7 +17,7 @@ logger = get_logger(__name__)
 
 class SearchAgent:
     """
-    Search Agent using Microsoft Agent Framework's AzureOpenAIChatClient.
+    Search Agent using Microsoft Agent Framework 1.11.
     Provides intelligent search capabilities backed by Azure AI Search.
     """
     
@@ -41,7 +39,7 @@ class SearchAgent:
         # Create function tools
         tools = self._create_tools()
         
-        # Initialize agent using AzureOpenAIChatClient pattern
+        # Initialize the MAF agent.
         self.agent = self._create_agent(tools)
         
         logger.info(f"SearchAgent '{agent_id}' initialized successfully")
@@ -84,7 +82,12 @@ class SearchAgent:
         
         return [search_knowledge_base, parallel_search]
 
-    async def search_knowledge_base(self, query: str, top_k: int = 10) -> Dict[str, Any]:
+    async def search_knowledge_base(
+        self,
+        query: str,
+        top_k: int = 10,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         """
         Search the enterprise knowledge base using hybrid search.
         Process: Searches for 20 candidates, reranks, and returns top results.
@@ -97,8 +100,24 @@ class SearchAgent:
         )
 
         # 1. Search for candidates (up to 20)
-        results = await self.search_tool.search(query, top_k=candidate_k)
+        results = await self.search_tool.search(
+            query,
+            top_k=candidate_k,
+            progress_callback=progress_callback,
+        )
         total_found = len(results)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "candidate_selection",
+                    "state": "running",
+                    "message": "Select relevant candidates",
+                    "detail": "Apply relevance cutoff and remove near-duplicate chunks",
+                    "category": "filtering",
+                    "metrics": {"candidate_count": total_found, "requested_top_k": top_k},
+                }
+            )
 
         # 2. If reranker enabled, keep only effectively relevant items (adaptive cutoff),
         #    then apply top_k. This makes the final count reflect real relevance rather
@@ -131,13 +150,41 @@ class SearchAgent:
                     deduped.append(r)
 
                 final_results_list = deduped[:top_k]
+                selection_metrics = {
+                    "candidate_count": total_found,
+                    "cutoff": round(cutoff, 4),
+                    "after_cutoff": len(filtered),
+                    "after_deduplication": len(deduped),
+                    "selected_count": len(final_results_list),
+                }
             else:
                 final_results_list = results[:top_k]
+                selection_metrics = {
+                    "candidate_count": total_found,
+                    "selected_count": len(final_results_list),
+                }
         else:
             final_results_list = results
+            selection_metrics = {
+                "candidate_count": total_found,
+                "selected_count": len(final_results_list),
+            }
 
         if not final_results_list and results:
             final_results_list = results[:1]
+            selection_metrics["selected_count"] = len(final_results_list)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "candidate_selection",
+                    "state": "completed",
+                    "message": "Select relevant candidates",
+                    "detail": "Apply relevance cutoff and remove near-duplicate chunks",
+                    "category": "filtering",
+                    "metrics": selection_metrics,
+                }
+            )
 
         # Format results for the LLM/UI to easily parse
         processed_results = []
@@ -208,41 +255,14 @@ class SearchAgent:
         }
     
     def _create_agent(self, tools: List):
-        """
-        Create agent instance using AzureOpenAIChatClient.
-        
-        Args:
-            tools: List of function tools
-            
-        Returns:
-            Configured agent
-        """
-        # Use API key or credential-based authentication
-        if AzureOpenAIConfig.use_api_key():
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                api_key=AzureOpenAIConfig.API_KEY,
-                api_version=AzureOpenAIConfig.API_VERSION
-            )
-        else:
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                credential=DefaultAzureCredential(),
-                api_version=AzureOpenAIConfig.API_VERSION
-            )
-        
-        agent = client.as_agent(
+        """Create the MAF SearchAgent."""
+        agent = create_maf_agent(
             name="SearchAgent",
             instructions=SEARCH_AGENT_PROMPT,
             tools=tools,
-            default_options={
-                "temperature": 0.6
-            }
+            temperature=0.6,
         )
-        
-        logger.info("SearchAgent created with AzureOpenAIChatClient")
+        logger.info("SearchAgent created with MAF OpenAIChatCompletionClient")
         return agent
     
     async def search(
@@ -263,7 +283,7 @@ class SearchAgent:
         logger.info(f"SearchAgent.search called with query: '{query}'")
         
         # Run the agent
-        result = await self.agent.run(query, thread=thread)
+        result = await run_agent(self.agent, query, session=thread)
         
         logger.info(f"SearchAgent.search completed, response length: {len(result.text)}")
         

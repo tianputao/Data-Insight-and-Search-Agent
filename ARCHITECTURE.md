@@ -18,7 +18,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 ┌──────────────────────────────────────────────────────────────────┐
 │                FastAPI Backend  (src/api/main.py)                 │
 │   POST /chat/stream   POST /threads/new   GET /skills  …         │
-│   SkillRegistry.scan() at startup; per-request SSE stream        │
+│   MAF FileSkillsSource discovery; per-request SSE stream         │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -29,8 +29,8 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │  │                  │  │ _queries       │  │                 │  │
 │  └──────────────────┘  └────────────────┘  └─────────────────┘  │
 │  ┌──────────────────┐  ┌────────────────┐                        │
-│  │delegate_metadata │  │delegate_data   │  SkillInjector injects  │
-│  │                  │  │_insight        │  skills XML into prompt │
+│  │delegate_metadata │  │delegate_data   │  SkillsProvider scopes   │
+│  │                  │  │_insight        │  skills per sub-agent    │
 │  └──────────────────┘  └────────────────┘                        │
 └────┬─────────────────┬────────────────────┬───────────────────────┘
      │                 │                    │
@@ -40,10 +40,10 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │ Agent    │  │                │  │                         │
 │          │  │ list_schemas   │  │ get_relevant_tables     │
 │ search_  │  │ list_tables    │  │ execute_sql             │
-│ knowledge│  │ get_table_     │  │ load_skill              │
+│ knowledge│  │ get_table_     │  │ analytics-spec (MAF)    │
 │ _base    │  │ _details       │  │                         │
 │ parallel │  │ search_tables  │  └──────────┬──────────────┘
-│ _search  │  │ load_skill     │             │
+│ _search  │  │ metadata-mapping│             │
 └────┬─────┘  └───────┬────────┘             │
      │                │                      │
      ▼                ▼                      ▼
@@ -105,8 +105,10 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 |------|---------|---------|
 | `thinking` | `{"message": "..."}` | Agent reasoning step |
 | `text` | `{"content": "..."}` | Response token chunk |
+| `answer_reset` | `{}` | Retract text when a following tool call proves it was working narration |
 | `refs` | `{num: [title, url]}` | Citation map from tool calls |
 | `done` | — | Stream complete |
+| `stopped` | `{"message": "..."}` | Current thread task was cancelled by the user |
 | `error` | `{"message": "..."}` | Error description |
 
 **Citation pipeline**:
@@ -114,11 +116,21 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 2. Backend `_extract_search_references` and `_normalize_citations_and_references` merge and format citations (preserving documents without a URL as plain-text footnotes)
 3. Frontend `normalizeCitationsForDisplay()` renders `[n] [title](url)` (linked) or `[n] title` (plain)
 
-**Lifecycle**: A single `MasterAgent` is created at startup. The `SkillRegistry` scans `skills/` once on startup and injects skill metadata XML into agent prompts.
+**Lifecycle**: A single `MasterAgent` is created at startup, while each browser thread owns an isolated MAF `AgentSession`. Each user turn creates a request-local `QueryEngineContext`; `ContextVar` propagation keeps tool outcomes, search attempts, original intent, and the SSE sink isolated across concurrent sessions. Agent-scoped native `SkillsProvider` instances advertise and load repository Skills.
+
+**Session isolation and concurrency**:
+- Frontend messages, loading state, and `AbortController` are keyed by `thread_id`; switching sessions never redirects an in-flight stream into another session.
+- Backend `active_runs` permits one active task per thread while different MAF `AgentSession` objects execute concurrently.
+- `POST /threads/{thread_id}/stop` cancels only that thread's MAF run and signals cooperative cancellation to delegated-agent worker waits.
+
+**Memory and cache**:
+- MAF `AgentSession` retains conversation history for contextual follow-up questions within one thread. A new thread starts with a separate history and memory state.
+- The application also keeps a process-local, thread-scoped exact response cache. A normalized repeated question within `SESSION_RESPONSE_CACHE_TTL_SECONDS` returns the completed answer without calling Azure OpenAI, Azure AI Search, or Databricks.
+- Cache entries never cross thread boundaries and are cleared when the backend process restarts or the thread is deleted.
 
 ### 3. MasterAgent (`src/agents/master_agent.py`)
 
-**Framework**: MAF `AzureOpenAIChatClient.as_agent()` with in-memory thread store
+**Framework**: MAF 1.11 `OpenAIChatCompletionClient.as_agent()` with in-memory `AgentSession`
 
 **Auth**: Controlled by `AzureOpenAIConfig.use_api_key()`:
 - `AZURE_OPENAI_AUTH_MODE=key` → API key
@@ -133,9 +145,13 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `search_multiple_queries` | Executes a list of sub-queries via SearchAgent in parallel |
 | `search_knowledge` | Executes a single search and pushes citation refs to the SSE stream |
 | `delegate_metadata` | Streams a Unity Catalog schema question to MetadataAgent |
-| `delegate_data_insight` | Streams a data analytics question to DataInsightAgent |
+| `delegate_data_analysis` | Deterministically runs MetadataAgent, then immediately streams DataInsightAgent with the returned schema context |
 
-**Input routing logic**: MasterAgent uses `MASTER_AGENT_PROMPT` (with injected skill XML) to decide which tool to call. Questions requiring data analytics or schema discovery are delegated; knowledge questions flow through `search_knowledge` / `search_multiple_queries`.
+**Input routing logic**: MasterAgent uses `MASTER_AGENT_PROMPT` to decide which tool to call. Questions requiring data analytics or schema discovery are delegated; knowledge questions flow through `search_knowledge` / `search_multiple_queries`. Databricks Skills are advertised only inside their assigned sub-agents.
+
+**Agentic loop ownership**: A user turn invokes `MasterAgent` exactly once. Its MAF `OpenAIChatCompletionClient` owns the bounded function-invocation loop: it streams a model response, executes requested Agent/tools, appends each function result as an observation, and calls the model again. The loop exits when the model emits no further function call, reaches the configured model-roundtrip/function-call limit, or reaches the consecutive-error limit. There is no second answer judge, hidden feedback turn, or fixed 180-second MasterAgent timeout.
+
+This matches the central Claude QueryEngine control path while retaining MAF's native function-call protocol. Request-local `ToolOutcome` records are observability data only; they do not trigger a second `agent.run()`.
 
 ### 4. SearchAgent (`src/agents/search_agent.py`)
 
@@ -165,7 +181,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 |------|-------------|
 | `get_relevant_tables` | Lists tables in the Unity Catalog schema matching a topic |
 | `execute_sql` | Runs a SQL query against the Databricks SQL Warehouse; returns rows as JSON |
-| `load_skill` | Loads full body of a named skill from the SkillRegistry |
+| Native Skill | `SkillsProvider` advertises and loads `analytics-spec` on demand |
 
 **Configuration**: `DatabricksConfig` — `HOST`, `TOKEN`, `HTTP_PATH`, `CATALOG`, `SCHEMAS` (comma-separated list), `MAX_ROWS`, `QUERY_TIMEOUT`. The agent is only instantiated when `DatabricksConfig.is_configured()` returns `True`.
 
@@ -181,13 +197,13 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `list_tables` | Lists tables within a schema |
 | `get_table_details` | Returns column names, types, and comments for a table |
 | `search_tables` | Fuzzy-matches table names by keyword |
-| `load_skill` | Loads a skill body from the SkillRegistry |
+| Native Skill | `SkillsProvider` advertises and loads `metadata-mapping` on demand |
 
 ### 7. Skill System
 
-**SkillRegistry** (`src/registry.py`): Scans all `skills/*/SKILL.md` files at startup; registers `SkillMeta` objects (name, description, tags, body).
+**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. DataInsightAgent receives `analytics-spec`; MetadataAgent receives `metadata-mapping`; MasterAgent and SearchAgent do not receive Databricks Skills.
 
-**SkillInjector** (`src/injector.py`): Builds an XML block listing available skills and injects it into agent system prompts. On demand, `load_skill_full_body(name)` returns the complete SKILL.md content (logged with char count and SHA256 for verification).
+MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on demand, then optionally read resources or execute approval-gated scripts.
 
 **Current skills**:
 
@@ -214,12 +230,12 @@ User Question
       ↓
 [FastAPI POST /chat/stream]
       ↓
-MasterAgent.chat_stream()  (MAF thread)
+MasterAgent.chat_stream()  (one main AgentSession run)
       ↓
   ┌──────────────────────────────┐
-  │ Simple question?             │  → search_knowledge (single SearchAgent call)
-  │ Complex question?            │  → decompose_query → search_multiple_queries
-  │ Agentic retrieval ON?        │  → search_knowledge (agentic mode in search tool)
+      │ Normalize/correct/enrich      │
+      │ Simple question?             │  → search_knowledge (single SearchAgent call)
+      │ Complex/multi-part question? │  → decompose_query → search_multiple_queries
   └──────────────────────────────┘
       ↓
 SearchAgent.search_knowledge_base()
@@ -234,6 +250,9 @@ MasterAgent: push "refs" event to SSE queue
       ↓
 MasterAgent: synthesize answer with retrieved context
       ↓
+Stream answer tokens immediately
+      └── if a later tool call follows, send answer_reset and classify prior text as narration
+      ↓
 SSE stream: thinking → text chunks → refs → done
       ↓
 Frontend: render answer + citations
@@ -244,7 +263,11 @@ Frontend: render answer + citations
 ```
 User Question (analytics intent detected)
       ↓
-MasterAgent → delegate_data_insight()
+MasterAgent → delegate_data_analysis()
+      ↓
+MetadataAgent resolves UC schema and returns schema_context
+      ↓
+DataInsightAgent receives schema_context, loads matching Skills, and executes SQL
       ↓
 DataInsightAgent.query_stream()
   ├── load_skill("analytics-spec")  → injects query conventions
@@ -334,8 +357,8 @@ For AAD mode, the running identity needs the *Cognitive Services OpenAI User* ro
 ### Adding a New Skill
 
 1. Create `skills/my-skill/SKILL.md` with YAML frontmatter (`name`, `description`, `tags`)
-2. The `SkillRegistry` picks it up automatically on next startup
-3. Agents with a `load_skill` tool can retrieve its full body at runtime
+2. Assign the directory name to the intended agent in `src/skills_provider.py`
+3. MAF `SkillsProvider` advertises it on the next startup and loads it on demand
 
 ### Adding New Search Index Fields
 

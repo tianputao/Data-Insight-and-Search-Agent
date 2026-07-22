@@ -136,7 +136,7 @@ start_frontend() {
   info "Starting React frontend on port ${FRONTEND_PORT}…"
   cd "${FRONTEND_DIR}"
   export VITE_API_BASE_URL="/api"
-  exec npm run dev -- --port "${FRONTEND_PORT}"
+  exec npm run dev -- --port "${FRONTEND_PORT}" --strictPort
 }
 
 start_streamlit() {
@@ -241,7 +241,7 @@ start_full_stack() {
   (
     cd "${FRONTEND_DIR}"
     VITE_API_BASE_URL="/api" \
-    npm run dev -- --port "${FRONTEND_PORT}"
+    npm run dev -- --port "${FRONTEND_PORT}" --strictPort
   ) &
   FRONTEND_PID=$!
 

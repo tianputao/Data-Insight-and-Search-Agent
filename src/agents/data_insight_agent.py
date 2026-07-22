@@ -4,10 +4,10 @@ Data Insight Agent — executes analytical SQL / SparkSQL against Azure Databric
 Architecture
 ------------
 * Built on the same Microsoft Agent Framework (MAF) pattern as SearchAgent.
-* Uses AzureOpenAIChatClient + function tools (no Databricks SDK yet, uses
+* Uses MAF OpenAIChatCompletionClient + function tools (no Databricks SDK yet, uses
   databricks-sql-connector for JDBC-style queries).
 * Receives schema context from MetadataAgent (injected as part of the question).
-* Skill context is injected into the system prompt at initialisation via SkillInjector.
+* MAF SkillsProvider advertises and loads agent-scoped skills on demand.
 
 Tools provided to the LLM
 --------------------------
@@ -21,17 +21,20 @@ from __future__ import annotations
 import json
 import re
 import threading
-import hashlib
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
-from agent_framework.azure import AzureOpenAIChatClient
-from azure.identity import DefaultAzureCredential
 
-from ..config import AzureOpenAIConfig, DatabricksConfig
+from ..config import DatabricksConfig
 from ..prompts import DATA_INSIGHT_AGENT_PROMPT
-from ..injector import skill_injector
+from ..skills_provider import create_skills_provider
 from ..utils import get_logger
+from .maf_runtime import (
+    create_agent as create_maf_agent,
+    create_session,
+    run_agent,
+    stream_agent,
+)
 
 logger = get_logger(__name__)
 
@@ -84,6 +87,7 @@ def _get_db_connection():
             server_hostname=DatabricksConfig.HOST.replace("https://", ""),
             http_path=DatabricksConfig.HTTP_PATH,
             access_token=DatabricksConfig.TOKEN,
+            _socket_timeout=DatabricksConfig.QUERY_TIMEOUT,
         )
         return _db_connection
 
@@ -111,7 +115,7 @@ def _run_databricks_query(sql: str, max_rows: int = 500) -> Dict[str, Any]:
 
 class DataInsightAgent:
     """
-    Data Insight Agent using Microsoft Agent Framework's AzureOpenAIChatClient.
+    Data Insight Agent using Microsoft Agent Framework 1.11.
     Generates and executes SQL queries against Azure Databricks Delta tables.
     """
 
@@ -306,53 +310,15 @@ class DataInsightAgent:
                 logger.error(f"[Tool:execute_sql] Unexpected error: {exc}", exc_info=True)
                 return f"Query execution failed: {exc}"
 
-        def load_skill(
-            skill_name: Annotated[
-                str,
-                Field(description="The exact name of the skill to load (from the available_skills list)"),
-            ]
-        ) -> str:
-            """
-            Load the full instruction body of a named skill into the current context.
-            Use this when you need detailed domain knowledge (e.g. column mappings, KPI formulas)
-            before generating a query.
-            """
-            logger.info(f"[Tool:load_skill] Loading skill '{skill_name}'")
-            body = skill_injector.load_skill_full_body(skill_name)
-            if body is None:
-                return f"Skill '{skill_name}' not found. Available skills: {skill_injector.build_skill_selection_info('')}"
-            body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
-            logger.info(
-                f"[Tool:load_skill] Skill '{skill_name}' context returned to DataInsightAgent "
-                f"(chars={len(body)}, sha256_12={body_hash})."
-            )
-            return body
-
-        return [get_relevant_tables, execute_sql, load_skill]
+        return [get_relevant_tables, execute_sql]
 
     # ─────────────────────────────────────────────────────────────────────────
     # Agent creation
     # ─────────────────────────────────────────────────────────────────────────
 
     def _create_agent(self, tools: List):
-        """Initialise the AzureOpenAIChatClient agent."""
-        if AzureOpenAIConfig.use_api_key():
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                api_key=AzureOpenAIConfig.API_KEY,
-                api_version=AzureOpenAIConfig.API_VERSION,
-            )
-        else:
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                credential=DefaultAzureCredential(),
-                api_version=AzureOpenAIConfig.API_VERSION,
-            )
-
-        # Inject skill metadata into the system prompt
-        enriched_prompt = skill_injector.inject_skills_metadata(DATA_INSIGHT_AGENT_PROMPT)
+        """Initialise the MAF DataInsightAgent."""
+        enriched_prompt = DATA_INSIGHT_AGENT_PROMPT
         # Add Databricks config context (list all available schemas)
         schemas_list = ", ".join(f"`{s}`" for s in DatabricksConfig.SCHEMAS)
         db_context = (
@@ -366,13 +332,15 @@ class DataInsightAgent:
         )
         enriched_prompt += db_context
 
-        agent = client.as_agent(
+        skills_provider = create_skills_provider("DataInsightAgent")
+        agent = create_maf_agent(
             name="DataInsightAgent",
             instructions=enriched_prompt,
             tools=tools,
-            default_options={"temperature": 0.6},  # deterministic for SQL generation
+            temperature=0.6,
+            context_providers=[skills_provider] if skills_provider else None,
         )
-        logger.info("DataInsightAgent created with AzureOpenAIChatClient.")
+        logger.info("DataInsightAgent created with MAF OpenAIChatCompletionClient.")
         return agent
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -381,7 +349,7 @@ class DataInsightAgent:
 
     def get_new_thread(self):
         """Create a new MAF conversation thread."""
-        return self.agent.get_new_thread()
+        return create_session(self.agent)
 
     async def query(
         self,
@@ -410,7 +378,7 @@ class DataInsightAgent:
                 f"<schema_context>\n{schema_context}\n</schema_context>\n\n{question}"
             )
 
-        result = await self.agent.run(full_question, thread=thread)
+        result = await run_agent(self.agent, full_question, session=thread)
         logger.info(f"DataInsightAgent.query completed, len={len(result.text)}")
         return result.text
 
@@ -427,5 +395,5 @@ class DataInsightAgent:
                 f"<schema_context>\n{schema_context}\n</schema_context>\n\n{question}"
             )
 
-        async for update in self.agent.run_stream(full_question, thread=thread):
+        async for update in stream_agent(self.agent, full_question, session=thread):
             yield update

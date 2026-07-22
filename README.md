@@ -5,15 +5,18 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 ## 🌟 Features
 
 ### Core Capabilities
-- **Multi-Agent Architecture**: MasterAgent orchestrates four specialized agents — SearchAgent, DataInsightAgent, MetadataAgent — each with domain-specific tools
-- **Skill System**: Plugin-based skill registry (`skills/`) injects domain expertise into agent prompts at runtime; agents can call `load_skill` to retrieve full skill body on demand
-- **Intelligent Query Processing**: Automatic query decomposition (`decompose_query`), multi-query parallel search (`search_multiple_queries`), and selective delegation by question type
+- **Multi-Agent Architecture**: MasterAgent orchestrates three specialized agents — SearchAgent, DataInsightAgent, and MetadataAgent — each with domain-specific tools
+- **MasterAgent Agentic Loop**: One bounded MAF function loop repeats model → Agent/tool → observation until the model emits a final answer without another tool call
+- **Skill System**: Native MAF `SkillsProvider` advertises agent-scoped skills and loads full instructions or indexed resources on demand
+- **Intelligent Query Processing**: Query correction and enrichment, automatic decomposition (`decompose_query`), multi-query parallel search (`search_multiple_queries`), aggregation, and selective delegation by question type
 - **Hybrid Search**: Combines vector search (text-embedding-3-large, 3072d) and keyword search (BM25) against a rich index schema
 - **Semantic Reranking**: Configurable Azure AI Search semantic reranker for improved result relevance
 - **Agentic Retrieval**: Optional Azure AI Search agentic retrieval mode for automated query understanding
 - **Data Insight**: DataInsightAgent executes natural-language-to-SQL queries against Azure Databricks Unity Catalog
 - **Metadata Browsing**: MetadataAgent lists schemas, tables, and column details from Unity Catalog
 - **Multi-turn Conversations**: Context-aware dialogue with MAF in-memory thread store; each browser session gets an isolated thread
+- **Concurrent Sessions**: Each thread has independent messages, loading state, MAF history, cancellation, and can run alongside other threads
+- **Stop & Session Cache**: Stop cancels only the active thread; exact repeated questions can reuse a completed answer from the same session without external calls
 - **Streaming SSE Responses**: FastAPI backend streams `thinking`, `text`, `refs`, `done`, and `error` events to the React frontend
 - **Citation Pipeline**: Search references are collected during tool calls, merged across sources, and rendered as inline footnotes with optional Blob Storage URLs
 
@@ -21,7 +24,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **LLM**: Azure OpenAI GPT-5.1
 - **Embedding**: text-embedding-3-large (3072 dimensions)
 - **Vector Database**: Azure AI Search
-- **Agent Framework**: Microsoft Agent Framework (MAF) — `AzureOpenAIChatClient`
+- **Agent Framework**: Microsoft Agent Framework 1.11 — `OpenAIChatCompletionClient`
 - **Primary Frontend**: React + TypeScript (Vite, port 3000)
 - **Backend API**: FastAPI with Server-Sent Events (port 8000)
 - **Secondary Frontend**: Streamlit standalone app (`app.py`, port 8501) — RAG only
@@ -49,13 +52,13 @@ flowchart TD
 
     subgraph Skills["Skill System"]
         direction LR
-        SR["SkillRegistry"]
-        SI["SkillInjector"]
-        SR --> SI
+        SP["MAF SkillsProvider"]
+        FS["FileSkillsSource"]
+        FS --> SP
     end
 
     subgraph AgentLayer["Agent Layer — Microsoft Agent Framework · Azure OpenAI GPT-5.1"]
-        MA(["🧠 MasterAgent"])
+        MA(["🧠 MasterAgent\nBounded agentic loop"])
         SA(["🔍 SearchAgent"])
         DIA(["📊 DataInsightAgent"])
         META(["🗂️ MetadataAgent"])
@@ -80,7 +83,7 @@ flowchart TD
     Streamlit -->|direct| MA
     API --> MA
 
-    SI -.->|inject skills| MA & DIA & META
+    SP -.->|agent-scoped skills| DIA & META
 
     SA --> AIS & AOAI
     AIS --> Blob
@@ -98,14 +101,17 @@ Comprehensive_AI_Agent/
 │   ├── agents/
 │   │   ├── master_agent.py      # Orchestration agent; tools: decompose_query,
 │   │   │                        #   search_multiple_queries, search_knowledge,
-│   │   │                        #   delegate_metadata, delegate_data_insight
+│   │   │                        #   delegate_metadata, delegate_data_analysis
 │   │   ├── search_agent.py      # Azure AI Search; tools: search_knowledge_base,
 │   │   │                        #   parallel_search
 │   │   ├── data_insight_agent.py# Databricks SQL; tools: get_relevant_tables,
-│   │   │                        #   execute_sql, load_skill
-│   │   └── metadata_agent.py    # Unity Catalog schema; tools: list_schemas,
-│   │                            #   list_tables, get_table_details, search_tables,
-│   │                            #   load_skill
+│   │   │                        #   execute_sql; native Skill: analytics-spec
+│   │   ├── metadata_agent.py    # Unity Catalog schema; tools: list_schemas,
+│   │                            #   list_tables, get_table_details, search_tables;
+│   │                            #   native Skill: metadata-mapping
+│   │   └── maf_runtime.py       # MAF 1.11 client/session/stream adapter
+│   ├── query_engine.py          # Request-scoped MasterAgent observations,
+│   │                            #   search attempts, and streaming context
 │   ├── api/
 │   │   └── main.py              # FastAPI server: SSE /chat/stream + REST endpoints
 │   ├── tools/
@@ -115,13 +121,14 @@ Comprehensive_AI_Agent/
 │   ├── config/
 │   │   └── settings.py          # AzureOpenAIConfig, AzureSearchConfig,
 │   │                            #   AzureAIFoundryConfig, DatabricksConfig, AppConfig
-│   ├── injector.py              # SkillInjector: builds XML skill metadata for prompts
-│   ├── registry.py              # SkillRegistry: scans skills/ directory at startup
+│   ├── skills_provider.py       # Agent-scoped native MAF SkillsProvider factory
 │   └── utils/
 │       └── logger.py            # Logging utilities
 ├── skills/
 │   ├── analytics-spec/          # Skill: data analytics query patterns
-│   │   └── SKILL.md
+│   │   ├── SKILL.md             # Intent routing + resource index
+│   │   └── references/
+│   │       └── highest-spending-customer.sql
 │   └── metadata-mapping/        # Skill: Unity Catalog metadata conventions
 │       └── SKILL.md
 ├── frontend/                    # React + TypeScript (Vite)

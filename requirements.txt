@@ -1,10 +1,8 @@
 # MAF Data Insight Agent — Python Dependencies
 
 # ── Core Framework (Microsoft Agent Framework) ────────────────────────────────
-agent-framework-core==1.0.0b260116
-agent-framework==1.0.0b260116
-# Pin to 0.4.13: version 0.4.14 removed SpanAttributes.LLM_SYSTEM which agent-framework requires
-opentelemetry-semantic-conventions-ai==0.4.13
+agent-framework-core==1.11.0
+agent-framework-openai==1.10.1
 
 # ── Azure Services ────────────────────────────────────────────────────────────
 azure-search-documents>=11.4.0
@@ -12,7 +10,7 @@ azure-core>=1.29.0
 azure-identity>=1.15.0
 
 # ── OpenAI (Azure OpenAI) ─────────────────────────────────────────────────────
-openai>=1.12.0
+openai>=2.25.0,<3
 
 # ── FastAPI backend (replaces Streamlit as primary serving layer) ─────────────
 fastapi>=0.110.0
@@ -28,9 +26,6 @@ python-dotenv>=1.0.0
 # ── Azure Databricks ─────────────────────────────────────────────────────────
 databricks-sql-connector>=3.0.0    # JDBC-style SQL execution against Databricks warehouse
 databricks-sdk>=0.20.0             # Unity Catalog REST API (table/schema metadata)
-
-# ── Skill Registry ────────────────────────────────────────────────────────────
-python-frontmatter>=1.1.0          # Parse YAML front-matter from SKILL.md files
 
 # ── Data Processing ───────────────────────────────────────────────────────────
 numpy>=1.24.0

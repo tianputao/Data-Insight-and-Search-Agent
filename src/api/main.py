@@ -31,8 +31,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from threading import Event
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
@@ -45,12 +48,26 @@ from pydantic import BaseModel
 from src.agents import MasterAgent, SearchAgent, DataInsightAgent, MetadataAgent
 from src.tools import AzureAISearchTool
 from src.config import AppConfig, AzureSearchConfig, DatabricksConfig
-from src.registry import skill_registry
 from src.utils import get_logger
+from src.utils.activity import (
+    delegated_agent,
+    narration_activity,
+    tool_activity,
+)
+from src.skills_provider import list_skill_metadata
 
 logger = get_logger(__name__)
 
 # ─── Application state ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class ActiveRun:
+    """One in-flight agent task owned by a single conversation thread."""
+
+    run_id: str
+    cancel_event: Event
+    task: Optional[asyncio.Task] = None
 
 class AppState:
     """Holds singletons shared across all requests."""
@@ -60,6 +77,8 @@ class AppState:
     threads: Dict[str, object] = {}
     # thread_id → list of {"user": str, "assistant": str, "timestamp": str}
     thread_history: Dict[str, List[dict]] = {}
+    # A thread may run one task at a time; different threads run concurrently.
+    active_runs: Dict[str, ActiveRun] = {}
     initialized: bool = False
     init_error: Optional[str] = None
 
@@ -74,11 +93,7 @@ async def lifespan(app: FastAPI):
     """FastAPI lifespan context — runs startup logic before serving requests."""
     logger.info("FastAPI server starting up…")
 
-    # 1. Scan skills directory
-    skill_count = skill_registry.scan()
-    logger.info(f"Skills loaded: {skill_count}")
-
-    # 2. Initialise agents
+    # Initialise agents and their native MAF Skill providers.
     try:
         search_tool = AzureAISearchTool(
             enable_semantic_reranker=AppConfig.DEFAULT_ENABLE_SEMANTIC_RERANKER,
@@ -103,6 +118,8 @@ async def lifespan(app: FastAPI):
         )
         state.initialized = True
         logger.info("MasterAgent initialised successfully.")
+        skills = await list_skill_metadata(state.master_agent.agent)
+        logger.info(f"Skills discovered by MAF: {len(skills)}")
 
     except Exception as exc:
         state.init_error = str(exc)
@@ -155,6 +172,61 @@ class ThreadInfo(BaseModel):
 def _sse(data: dict) -> str:
     """Format a dict as a Server-Sent Events data line."""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _normalize_cache_question(question: str) -> str:
+    """Normalize an exact question for safe, session-local response caching."""
+    normalized = unicodedata.normalize("NFKC", question or "").strip().casefold()
+    return " ".join(normalized.split())
+
+
+def _find_cached_response(thread_id: str, question: str) -> Optional[str]:
+    """Return the latest completed answer for the same question in this thread only."""
+    if not AppConfig.SESSION_RESPONSE_CACHE_ENABLED:
+        return None
+    cache_key = _normalize_cache_question(question)
+    if not cache_key:
+        return None
+    for turn in reversed(state.thread_history.get(thread_id, [])):
+        if AppConfig.SESSION_RESPONSE_CACHE_TTL_SECONDS > 0:
+            try:
+                cached_at = datetime.fromisoformat(str(turn.get("timestamp") or ""))
+                age_seconds = (datetime.now(timezone.utc) - cached_at).total_seconds()
+                if age_seconds > AppConfig.SESSION_RESPONSE_CACHE_TTL_SECONDS:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if (
+            _normalize_cache_question(str(turn.get("user") or "")) == cache_key
+            and str(turn.get("assistant") or "").strip()
+        ):
+            return str(turn["assistant"])
+    return None
+
+
+async def _cached_response_stream(
+    message: str,
+    thread_id: str,
+    cached_response: str,
+) -> AsyncGenerator[str, None]:
+    """Serve a session-memory hit without invoking MAF or external services."""
+    yield _sse(
+        {
+            "type": "thinking",
+            "id": f"cache-{uuid.uuid4().hex[:12]}",
+            "kind": "status",
+            "category": "session-cache",
+            "state": "completed",
+            "agent": "MasterAgent",
+            "message": "Reused answer from this session",
+            "summary": "Exact normalized question matched a completed turn",
+            "metrics": {"cache_hit": True},
+        }
+    )
+    yield _sse({"type": "text", "content": cached_response})
+    _append_history(thread_id, message, cached_response, cache_hit=True)
+    yield _sse({"type": "thinking_done"})
+    yield _sse({"type": "done", "content": cached_response, "cache_hit": True})
 
 
 def _ensure_blob_sas_url(url: str, is_image: bool = False) -> str:
@@ -579,45 +651,45 @@ def _normalize_citations_and_references(
     return body, ref_lines
 
 
-def _make_thinking_event(tool_name: str, args: dict) -> Optional[str]:
+def _repair_collapsed_markdown_tables(text: str) -> str:
+    """Restore newlines when a model flattens an entire GFM table into one line.
+
+    A flattened table contains a markdown separator cell (``---``) and adjacent
+    closing/opening row pipes (``| |`` or ``||``). Normal multiline tables and
+    ordinary prose containing pipes are left unchanged.
     """
-    Map a tool name + args to a human-readable thinking message with [Agent] prefix.
-    Returns None for tools that should be silently ignored.
-    """
-    if tool_name == "search_knowledge":
-        # Thinking for this tool is pushed in real-time from inside search_knowledge() via the
-        # combined queue, so we suppress the MAF function_call event here to avoid duplication.
-        return None
-    elif tool_name == "search_multiple_queries":
-        n = len(args.get("queries", []))
-        return f"🔍 [MasterAgent → SearchAgent] 并行检索 ({n} 个子查询)"
-    elif tool_name == "decompose_query":
-        return f"🧩 [MasterAgent] 分解复杂查询…"
-    elif tool_name == "delegate_metadata":
-        return f"🗂️ [MasterAgent → MetadataAgent] 查询数据结构: {args.get('question', '')[:80]}"
-    elif tool_name == "delegate_data_insight":
-        return f"📊 [MasterAgent → DataInsightAgent] 数据分析: {args.get('question', '')[:80]}"
-    elif tool_name == "execute_sql":
-        sql = args.get("sql", "").strip()
-        return f"⚡ [DataInsightAgent] 执行 SQL:\n```sql\n{sql}\n```" if sql else "⚡ [DataInsightAgent] 执行 SQL…"
-    elif tool_name == "list_tables":
-        schema = args.get("schema", "") or "(所有 schema)"
-        return f"📄 [MetadataAgent] 列举数据表: {schema}"
-    elif tool_name == "get_table_details":
-        return f"📄 [MetadataAgent] 获取表结构: {args.get('table_name', '')}"
-    elif tool_name == "search_tables":
-        return f"🔍 [MetadataAgent] 按关键字搜索表: {args.get('keyword', '')}"
-    elif tool_name == "load_skill":
-        return f"📖 [DataInsightAgent] 加载业务规则: {args.get('skill_name', '')}"
-    elif tool_name == "get_relevant_tables":
-        return f"🗂️ [DataInsightAgent → MetadataAgent] 查找相关数据表"
-    return None  # unknown tool — skip
+    if not text or "|" not in text:
+        return text
+
+    repaired_lines: List[str] = []
+    in_fence = False
+    separator_pattern = re.compile(r"\|\s*:?-{3,}:?\s*\|")
+    row_boundary_pattern = re.compile(r"\|\s*\|")
+
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            repaired_lines.append(line)
+            continue
+
+        if (
+            not in_fence
+            and line.count("|") >= 6
+            and separator_pattern.search(line)
+            and row_boundary_pattern.search(line)
+        ):
+            repaired_lines.extend(row_boundary_pattern.sub("|\n|", line).splitlines())
+        else:
+            repaired_lines.append(line)
+
+    return "\n".join(repaired_lines)
 
 
 async def _stream_agent_response(
     message: str,
     thread,
     thread_id: str,
+    active_run: ActiveRun,
 ) -> AsyncGenerator[str, None]:
     """
     Run MasterAgent.chat_stream and convert MAF update objects to SSE events.
@@ -629,28 +701,27 @@ async def _stream_agent_response(
     """
     full_response_parts: List[str] = []
     search_ref_map: Dict[str, tuple[str, str]] = {}
-    _last_thinking: Optional[str] = None
-
-    def _think(msg: str) -> Optional[str]:
-        nonlocal _last_thinking
-        if msg and msg != _last_thinking:
-            _last_thinking = msg
-            return _sse({"type": "thinking", "message": msg})
-        return None
+    _working_text_parts: List[str] = []
+    _working_text_id = 1
 
     # ── Single combined queue — avoids all polling ────────────────────────────
     combined: asyncio.Queue = asyncio.Queue()
     main_loop = asyncio.get_event_loop()
 
-    # Expose to master_agent tools so they can push insight items directly
-    state.master_agent._insight_streaming = (combined, main_loop)
-
     async def feed_master():
         """Push every MAF update from chat_stream into the combined queue."""
-        stream = state.master_agent.chat_stream(message=message, thread=thread)
+        stream = state.master_agent.chat_stream(
+            message=message,
+            thread=thread,
+            stream_context=(combined, main_loop),
+            cancel_event=active_run.cancel_event,
+        )
         try:
             async for upd in stream:
                 await combined.put(("maf", upd))
+        except asyncio.CancelledError:
+            await combined.put(("cancelled", None))
+            raise
         except Exception as exc:
             await combined.put(("error", exc))
         finally:
@@ -658,38 +729,91 @@ async def _stream_agent_response(
                 await stream.aclose()
             except Exception:
                 pass
-            await combined.put(("done", None))
+            if not active_run.cancel_event.is_set():
+                await combined.put(("done", None))
 
     master_task = asyncio.create_task(feed_master())
+    active_run.task = master_task
 
     # ── Pending tool-call tracker (accumulates streamed args) ─────────────────
     # MAF may stream function_call arguments across multiple deltas.
     # We hold the last seen call name + accumulated args string.
     _pending_call_name: Optional[str] = None
     _pending_call_args: str = ""
+    _pending_call_id: str = ""
+    _tool_activities: Dict[str, dict] = {}
 
-    def _flush_pending_call() -> Optional[str]:
-        """Flush accumulated args for the pending function call and return SSE event."""
-        nonlocal _pending_call_name, _pending_call_args
-        if not _pending_call_name:
+    def _start_tool(name: str, args: dict, call_id: str, agent: Optional[str] = None) -> str:
+        activity = tool_activity(
+            name,
+            args,
+            call_id,
+            agent=agent or "MasterAgent",
+        )
+        _tool_activities[call_id] = activity
+        return _sse({"type": "thinking", **activity})
+
+    def _end_tool(call_id: str, error: bool = False) -> Optional[str]:
+        activity = _tool_activities.get(call_id)
+        if not activity:
             return None
+        return _sse(
+            {
+                "type": "thinking",
+                **activity,
+                "state": "error" if error else "completed",
+            }
+        )
+
+    def _reclassify_working_text() -> List[str]:
+        """Move assistant text followed by a tool call from answer to working narration."""
+        nonlocal _working_text_id, _working_text_parts
+        if not _working_text_parts:
+            return []
+        raw_text = "".join(_working_text_parts)
+        text = raw_text.strip()
+        segment_id = f"narration-{_working_text_id}"
+        _working_text_id += 1
+        _working_text_parts = []
+        if not text:
+            return []
+        full_response_parts.clear()
+        return [
+            _sse({"type": "answer_reset"}),
+            _sse({"type": "thinking", **narration_activity(
+                segment_id,
+                text,
+                agent="MasterAgent",
+            )}),
+        ]
+
+    def _flush_pending_call() -> List[str]:
+        """Flush accumulated tool arguments as a structured lifecycle event."""
+        nonlocal _pending_call_id, _pending_call_name, _pending_call_args
+        if not _pending_call_name:
+            return []
         try:
             args = json.loads(_pending_call_args) if _pending_call_args else {}
         except Exception:
             args = {}
-        msg = _make_thinking_event(_pending_call_name, args)
+        call_id = _pending_call_id or f"anonymous-{len(_tool_activities) + 1}"
+        events = _reclassify_working_text()
+        if delegated_agent(_pending_call_name) is None:
+            events.append(_start_tool(_pending_call_name, args, call_id, "MasterAgent"))
+        _pending_call_id = ""
         _pending_call_name = None
         _pending_call_args = ""
-        return _think(msg) if msg else None
+        return events
 
     def _process_maf_update(update) -> List[str]:
         """Convert one MAF update object → list of SSE strings."""
-        nonlocal _pending_call_name, _pending_call_args, search_ref_map
+        nonlocal _pending_call_id, _pending_call_name, _pending_call_args, search_ref_map
         events: List[str] = []
 
-        # Text delta
+        # Ordinary assistant text is streamed immediately. If a tool call follows,
+        # it is reclassified as working narration; the final trailing segment remains the answer.
         if hasattr(update, "text") and update.text:
-            full_response_parts.append(update.text)
+            _working_text_parts.append(update.text)
             events.append(_sse({"type": "text", "content": update.text}))
 
         if not (hasattr(update, "contents") and update.contents):
@@ -700,16 +824,33 @@ async def _stream_agent_response(
             if ct == "text":
                 continue
 
+            if ct == "text_reasoning":
+                reasoning_text = (getattr(content, "text", "") or "").strip()
+                if reasoning_text:
+                    events.append(
+                        _sse(
+                            {
+                                "type": "thinking",
+                                "id": "model-reasoning",
+                                "kind": "reasoning",
+                                "state": "running",
+                                "agent": "MasterAgent",
+                                "message": reasoning_text,
+                                "append": True,
+                            }
+                        )
+                    )
+                continue
+
             if ct == "function_call":
                 tname = getattr(content, "name", "") or ""
                 targs = getattr(content, "arguments", "") or ""
 
                 if tname and tname != _pending_call_name:
                     # New tool call started — flush the previous one first
-                    evt = _flush_pending_call()
-                    if evt:
-                        events.append(evt)
+                    events.extend(_flush_pending_call())
                     _pending_call_name = tname
+                    _pending_call_id = getattr(content, "call_id", "") or ""
                     _pending_call_args = targs
                 else:
                     # Same tool call — accumulate argument delta
@@ -718,24 +859,21 @@ async def _stream_agent_response(
                 # If args look complete (valid JSON), flush immediately
                 if _pending_call_args:
                     try:
-                        parsed = json.loads(_pending_call_args)
-                        evt = _flush_pending_call()
-                        if evt:
-                            events.append(evt)
+                        json.loads(_pending_call_args)
+                        events.extend(_flush_pending_call())
                     except json.JSONDecodeError:
                         pass  # args still streaming, wait for more
 
             elif ct == "function_result":
-                    result_payload = getattr(content, "result", None)
-                    parsed_refs = _extract_search_references_from_payload(result_payload)
-                    if parsed_refs:
-                        _merge_references(search_ref_map, parsed_refs)
-                    # Flush any pending call on result
-                    evt = _flush_pending_call()
-                    if evt:
-                        events.append(evt)
-                    # Note: search thinking steps are now pushed in real-time from
-                    # inside search_knowledge() — no JSON parsing needed here.
+                result_payload = getattr(content, "result", None)
+                parsed_refs = _extract_search_references_from_payload(result_payload)
+                if parsed_refs:
+                    _merge_references(search_ref_map, parsed_refs)
+                events.extend(_flush_pending_call())
+                call_id = getattr(content, "call_id", "") or ""
+                completed = _end_tool(call_id, error=bool(getattr(content, "exception", None)))
+                if completed:
+                    events.append(completed)
         return events
 
     try:
@@ -745,10 +883,13 @@ async def _stream_agent_response(
 
             if item_type == "done":
                 # Flush any remaining pending call
-                evt = _flush_pending_call()
-                if evt:
+                for evt in _flush_pending_call():
                     yield evt
                 break
+
+            elif item_type == "cancelled":
+                yield _sse({"type": "stopped", "message": "Task stopped by user"})
+                return
 
             elif item_type == "error":
                 raise item_data
@@ -766,18 +907,14 @@ async def _stream_agent_response(
                 if isinstance(item_data, dict):
                     _merge_references(search_ref_map, item_data)
 
-            elif item_type == "thinking":
-                # Sub-agent thinking steps (DataInsightAgent / MetadataAgent)
-                evt = _think(item_data)
-                if evt:
-                    yield evt
+            elif item_type == "activity" and isinstance(item_data, dict):
+                yield _sse({"type": "thinking", **item_data})
 
     except Exception as exc:
         logger.error(f"Streaming error: {exc}", exc_info=True)
         yield _sse({"type": "error", "message": str(exc)})
         return
     finally:
-        state.master_agent._insight_streaming = None
         # Cancel (if still running) and ALWAYS await master_task so async-generator
         # finalizers are drained before the request scope exits.
         if not master_task.done():
@@ -786,9 +923,20 @@ async def _stream_agent_response(
             await asyncio.wait_for(master_task, timeout=3)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
+        current_run = state.active_runs.get(thread_id)
+        if current_run is active_run:
+            state.active_runs.pop(thread_id, None)
+
+    # The only assistant text not followed by another tool call is the final answer.
+    final_text = "".join(_working_text_parts)
+    full_response_parts.append(final_text)
 
     # ── Post-process final response ───────────────────────────────────────────
     full_response = "".join(full_response_parts)
+
+    # Models occasionally preserve table pipes but collapse all row newlines.
+    # Repair that narrow malformed shape before citation/reference processing.
+    full_response = _repair_collapsed_markdown_tables(full_response)
 
     # Normalize markdown image alt from chunked figcaption form.
     full_response = re.sub(r'!\[<figcaption>(.*?)</figcaption>\]', r'![\1]', full_response)
@@ -820,6 +968,7 @@ async def _stream_agent_response(
 
     _append_history(thread_id, message, full_response)
 
+    yield _sse({"type": "thinking_done"})
     yield _sse({"type": "done", "content": full_response})
 
 
@@ -843,7 +992,13 @@ def _get_or_create_thread(thread_id: Optional[str]) -> tuple[str, object]:
     return new_id, thread
 
 
-def _append_history(thread_id: str, user_msg: str, assistant_msg: str) -> None:
+def _append_history(
+    thread_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    *,
+    cache_hit: bool = False,
+) -> None:
     """Store a completed turn in the thread history."""
     if thread_id not in state.thread_history:
         state.thread_history[thread_id] = []
@@ -852,6 +1007,7 @@ def _append_history(thread_id: str, user_msg: str, assistant_msg: str) -> None:
             "user": user_msg,
             "assistant": assistant_msg,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cache_hit": cache_hit,
         }
     )
 
@@ -926,14 +1082,54 @@ async def chat_stream(request: ChatRequest):
 
     thread_id, thread = _get_or_create_thread(request.thread_id)
 
+    existing_run = state.active_runs.get(thread_id)
+    if existing_run is not None:
+        if existing_run.task is None or not existing_run.task.done():
+            raise HTTPException(
+                status_code=409,
+                detail="This session already has an active task.",
+            )
+        state.active_runs.pop(thread_id, None)
+
+    cached_response = _find_cached_response(thread_id, request.message)
+    if cached_response is not None:
+        return StreamingResponse(
+            _cached_response_stream(request.message, thread_id, cached_response),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Thread-Id": thread_id,
+                "X-Cache": "HIT",
+            },
+        )
+
+    active_run = ActiveRun(
+        run_id=str(uuid.uuid4()),
+        cancel_event=Event(),
+    )
+    state.active_runs[thread_id] = active_run
+
     return StreamingResponse(
-        _stream_agent_response(request.message, thread, thread_id),
+        _stream_agent_response(request.message, thread, thread_id, active_run),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Thread-Id": thread_id,
         },
     )
+
+
+@app.post("/threads/{thread_id}/stop")
+async def stop_thread_run(thread_id: str):
+    """Cancel the active agent loop for one session without affecting other sessions."""
+    active_run = state.active_runs.get(thread_id)
+    if active_run is None:
+        return {"thread_id": thread_id, "stopped": False, "reason": "no_active_task"}
+
+    active_run.cancel_event.set()
+    if active_run.task is not None and not active_run.task.done():
+        active_run.task.cancel()
+    return {"thread_id": thread_id, "stopped": True, "run_id": active_run.run_id}
 
 
 @app.post("/threads/new")
@@ -977,6 +1173,9 @@ async def get_thread_history(thread_id: str):
 @app.delete("/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     """Delete a thread and its history from memory."""
+    active_run = state.active_runs.pop(thread_id, None)
+    if active_run is not None and active_run.task is not None and not active_run.task.done():
+        active_run.task.cancel()
     state.threads.pop(thread_id, None)
     state.thread_history.pop(thread_id, None)
     return {"deleted": thread_id}
@@ -985,7 +1184,9 @@ async def delete_thread(thread_id: str):
 @app.get("/skills")
 async def list_skills():
     """Return all indexed skills (name, description, tags)."""
-    return [s.to_dict() for s in skill_registry.list_skills()]
+    if state.master_agent is None:
+        return []
+    return await list_skill_metadata(state.master_agent.agent)
 
 
 # ─── Dev entry-point ───────────────────────────────────────────────────────────

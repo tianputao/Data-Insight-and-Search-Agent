@@ -2,7 +2,6 @@
 
 from .system_prompts import (
     MASTER_AGENT_PROMPT,
-    MASTER_AGENT_PROMPT_BASE,
     SEARCH_AGENT_PROMPT,
     DATA_INSIGHT_AGENT_PROMPT,
     METADATA_AGENT_PROMPT,
@@ -13,7 +12,6 @@ from .system_prompts import (
 
 __all__ = [
     'MASTER_AGENT_PROMPT',
-    'MASTER_AGENT_PROMPT_BASE',
     'SEARCH_AGENT_PROMPT',
     'DATA_INSIGHT_AGENT_PROMPT',
     'METADATA_AGENT_PROMPT',

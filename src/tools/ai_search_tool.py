@@ -5,7 +5,7 @@ Provides hybrid search (vector + keyword), semantic reranking, and agentic retri
 
 import asyncio
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -25,6 +25,32 @@ from ..utils import get_logger
 
 
 logger = get_logger(__name__)
+
+SearchProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+def _emit_search_progress(
+    callback: Optional[SearchProgressCallback],
+    stage: str,
+    state: str,
+    message: str,
+    *,
+    detail: Optional[str] = None,
+    category: str = "search",
+    metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        {
+            "stage": stage,
+            "state": state,
+            "message": message,
+            "detail": detail,
+            "category": category,
+            "metrics": metrics or {},
+        }
+    )
 
 
 class AzureAISearchTool:
@@ -282,7 +308,8 @@ class AzureAISearchTool:
         self,
         query: str,
         query_vector: Optional[List[float]] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        progress_callback: Optional[SearchProgressCallback] = None,
     ) -> List[Dict[str, Any]]:
         """
         Perform hybrid search with vector and keyword components.
@@ -304,16 +331,29 @@ class AzureAISearchTool:
             try:
                 if self.enable_agentic_retrieval:
                     logger.info(f"[AGENTIC MODE] Using Azure AI Search with enhanced semantic understanding")
-                    return await self._search_with_agentic_mode(query, query_vector, top_k)
+                    return await self._search_with_agentic_mode(
+                        query, query_vector, top_k, progress_callback
+                    )
                 else:
                     logger.info(f"[STANDARD MODE] Using standard hybrid search")
-                    return await self._search_standard(query, query_vector, top_k)
+                    return await self._search_standard(
+                        query, query_vector, top_k, progress_callback
+                    )
             except Exception as _exc:
                 _last_exc = _exc
                 _err = str(_exc)
                 _transient = any(k in _err for k in ("RemoteDisconnected", "Connection aborted", "ServiceResponseError", "ConnectionError"))
                 if _transient and _attempt < 2:
                     _wait = 1.5 * (_attempt + 1)
+                    _emit_search_progress(
+                        progress_callback,
+                        "search_retry",
+                        "running",
+                        "Retry Azure AI Search",
+                        detail=f"Transient connection failure; retry {_attempt + 2} of 3",
+                        category="retry",
+                        metrics={"attempt": _attempt + 2},
+                    )
                     logger.warning(
                         f"Transient Azure Search connection error (attempt {_attempt + 1}/3): {_exc}. "
                         f"Retrying in {_wait:.1f}s…"
@@ -327,7 +367,8 @@ class AzureAISearchTool:
         self,
         query: str,
         query_vector: Optional[List[float]] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        progress_callback: Optional[SearchProgressCallback] = None,
     ) -> List[Dict[str, Any]]:
         """
         Standard hybrid search implementation.
@@ -349,11 +390,34 @@ class AzureAISearchTool:
         
         # Generate embedding if not provided (hybrid search)
         if query_vector is None:
+            _emit_search_progress(
+                progress_callback,
+                "query_embedding",
+                "running",
+                "Generate query embedding",
+                category="embedding",
+            )
             try:
                 query_vector = self._generate_embedding(query)
+                _emit_search_progress(
+                    progress_callback,
+                    "query_embedding",
+                    "completed",
+                    "Generate query embedding",
+                    category="embedding",
+                    metrics={"dimensions": len(query_vector)},
+                )
             except Exception as e:
                 logger.warning(f"Embedding generation failed, falling back to keyword-only search: {e}")
                 query_vector = None
+                _emit_search_progress(
+                    progress_callback,
+                    "query_embedding",
+                    "error",
+                    "Generate query embedding",
+                    detail="Embedding failed; continuing with keyword retrieval",
+                    category="embedding",
+                )
 
         # Add vector search if embedding provided
         if query_vector:
@@ -370,6 +434,27 @@ class AzureAISearchTool:
             search_params["query_type"] = QueryType.SEMANTIC
             search_params["semantic_configuration_name"] = self.field_config["semantic_config_name"]
             logger.info("Semantic reranking enabled")
+
+        retrieval_mode = "keyword + vector" if query_vector else "keyword"
+        if self.enable_semantic_reranker:
+            retrieval_mode += " + semantic"
+        _emit_search_progress(
+            progress_callback,
+            "hybrid_retrieval",
+            "running",
+            "Run Azure AI Search retrieval",
+            detail=retrieval_mode,
+            metrics={"requested_candidates": k},
+        )
+        if self.enable_semantic_reranker:
+            _emit_search_progress(
+                progress_callback,
+                "semantic_ranking",
+                "running",
+                "Apply semantic ranking",
+                detail=self.field_config["semantic_config_name"],
+                category="ranking",
+            )
         
         # Execute search
         try:
@@ -454,6 +539,27 @@ class AzureAISearchTool:
                 processed_results.append(processed_result)
             
             logger.info(f"Search completed - Found {len(processed_results)} results")
+            _emit_search_progress(
+                progress_callback,
+                "hybrid_retrieval",
+                "completed",
+                "Run Azure AI Search retrieval",
+                detail=retrieval_mode,
+                metrics={"candidate_count": len(processed_results)},
+            )
+            if self.enable_semantic_reranker:
+                ranked_count = sum(
+                    result.get("reranker_score") is not None for result in processed_results
+                )
+                _emit_search_progress(
+                    progress_callback,
+                    "semantic_ranking",
+                    "completed",
+                    "Apply semantic ranking",
+                    detail=self.field_config["semantic_config_name"],
+                    category="ranking",
+                    metrics={"ranked_count": ranked_count},
+                )
             
             # Log detailed results with scores and reranker info
             if processed_results:
@@ -490,7 +596,8 @@ class AzureAISearchTool:
         self,
         query: str,
         query_vector: Optional[List[float]] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        progress_callback: Optional[SearchProgressCallback] = None,
     ) -> List[Dict[str, Any]]:
         """
         Execute search with agentic retrieval mode enabled.
@@ -534,10 +641,33 @@ class AzureAISearchTool:
         
         # Add vector search if embedding provided or can be generated
         if query_vector is None:
+            _emit_search_progress(
+                progress_callback,
+                "query_embedding",
+                "running",
+                "Generate query embedding",
+                category="embedding",
+            )
             try:
                 query_vector = self._generate_embedding(query)
+                _emit_search_progress(
+                    progress_callback,
+                    "query_embedding",
+                    "completed",
+                    "Generate query embedding",
+                    category="embedding",
+                    metrics={"dimensions": len(query_vector)},
+                )
             except Exception as e:
                 logger.warning(f"Embedding generation failed in agentic mode: {e}")
+                _emit_search_progress(
+                    progress_callback,
+                    "query_embedding",
+                    "error",
+                    "Generate query embedding",
+                    detail="Embedding failed; continuing with keyword retrieval",
+                    category="embedding",
+                )
         
         if query_vector:
             vector_query = VectorizedQuery(
@@ -549,6 +679,27 @@ class AzureAISearchTool:
             logger.info(f"[AGENTIC MODE] Hybrid search enabled (keyword + vector + semantic)")
         else:
             logger.info(f"[AGENTIC MODE] Semantic keyword search (no vector)")
+
+        retrieval_mode = "keyword + vector" if query_vector else "keyword"
+        if self.enable_semantic_reranker:
+            retrieval_mode += " + semantic"
+        _emit_search_progress(
+            progress_callback,
+            "hybrid_retrieval",
+            "running",
+            "Run Azure AI Search retrieval",
+            detail=retrieval_mode,
+            metrics={"requested_candidates": k},
+        )
+        if self.enable_semantic_reranker:
+            _emit_search_progress(
+                progress_callback,
+                "semantic_ranking",
+                "running",
+                "Apply semantic ranking",
+                detail=self.field_config["semantic_config_name"],
+                category="ranking",
+            )
         
         try:
             results = self.search_client.search(**search_params)
@@ -612,6 +763,27 @@ class AzureAISearchTool:
                 processed_results.append(processed_result)
             
             logger.info(f"[AGENTIC MODE] Search completed - Found {len(processed_results)} results")
+            _emit_search_progress(
+                progress_callback,
+                "hybrid_retrieval",
+                "completed",
+                "Run Azure AI Search retrieval",
+                detail=retrieval_mode,
+                metrics={"candidate_count": len(processed_results)},
+            )
+            if self.enable_semantic_reranker:
+                ranked_count = sum(
+                    result.get("reranker_score") is not None for result in processed_results
+                )
+                _emit_search_progress(
+                    progress_callback,
+                    "semantic_ranking",
+                    "completed",
+                    "Apply semantic ranking",
+                    detail=self.field_config["semantic_config_name"],
+                    category="ranking",
+                    metrics={"ranked_count": ranked_count},
+                )
             
             # Log detailed results
             if processed_results:
@@ -637,7 +809,8 @@ class AzureAISearchTool:
     async def parallel_search(
         self,
         queries: List[str],
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        progress_callback: Optional[SearchProgressCallback] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Execute multiple searches in parallel.
@@ -654,7 +827,29 @@ class AzureAISearchTool:
         import asyncio
         
         # Create search tasks
-        tasks = [self.search(query, top_k=top_k) for query in queries]
+        def callback_for_query(index: int, query: str) -> Optional[SearchProgressCallback]:
+            if progress_callback is None:
+                return None
+
+            def callback(progress: Dict[str, Any]) -> None:
+                enriched = dict(progress)
+                enriched["stage"] = f"query_{index + 1}_{progress.get('stage', 'search')}"
+                enriched["query_index"] = index + 1
+                enriched["query"] = query
+                detail = progress.get("detail")
+                enriched["detail"] = f"{query}\n{detail}" if detail else query
+                progress_callback(enriched)
+
+            return callback
+
+        tasks = [
+            self.search(
+                query,
+                top_k=top_k,
+                progress_callback=callback_for_query(index, query),
+            )
+            for index, query in enumerate(queries)
+        ]
         
         # Execute all searches in parallel
         all_results = await asyncio.gather(*tasks, return_exceptions=True)

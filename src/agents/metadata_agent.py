@@ -6,7 +6,7 @@ Architecture
 * Same MAF pattern as SearchAgent and DataInsightAgent.
 * Uses the Databricks SDK (`databricks-sdk`) for Unity Catalog REST API access.
 * Falls back to `databricks-sql-connector` JDBC queries when the SDK is unavailable.
-* Skill context injected at initialisation via SkillInjector.
+* MAF SkillsProvider advertises and loads agent-scoped skills on demand.
 
 Tools provided to the LLM
 --------------------------
@@ -24,13 +24,17 @@ import threading
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
-from agent_framework.azure import AzureOpenAIChatClient
-from azure.identity import DefaultAzureCredential
 
-from ..config import AzureOpenAIConfig, DatabricksConfig
+from ..config import DatabricksConfig
 from ..prompts import METADATA_AGENT_PROMPT
-from ..injector import skill_injector
+from ..skills_provider import create_skills_provider
 from ..utils import get_logger
+from .maf_runtime import (
+    create_agent as create_maf_agent,
+    create_session,
+    run_agent,
+    stream_agent,
+)
 
 logger = get_logger(__name__)
 
@@ -69,6 +73,7 @@ def _jdbc_query_metadata(sql: str) -> List[Dict[str, Any]]:
         server_hostname=DatabricksConfig.HOST.replace("https://", ""),
         http_path=DatabricksConfig.HTTP_PATH,
         access_token=DatabricksConfig.TOKEN,
+        _socket_timeout=DatabricksConfig.QUERY_TIMEOUT,
     )
     try:
         cursor = connection.cursor()
@@ -84,7 +89,7 @@ def _jdbc_query_metadata(sql: str) -> List[Dict[str, Any]]:
 
 class MetadataAgent:
     """
-    Metadata Agent using Microsoft Agent Framework's AzureOpenAIChatClient.
+    Metadata Agent using Microsoft Agent Framework 1.11.
     Retrieves and enriches Unity Catalog metadata for the DataInsightAgent.
     """
 
@@ -336,50 +341,15 @@ class MetadataAgent:
                 indent=2,
             )
 
-        def load_skill(
-            skill_name: Annotated[
-                str,
-                Field(description="The exact name of the skill to load"),
-            ]
-        ) -> str:
-            """
-            Load the full instruction body of a named skill.
-            Use when you need domain-specific column mappings or business term definitions
-            before building the schema summary.
-            """
-            logger.info(f"[Tool:load_skill] Loading skill '{skill_name}'")
-            body = skill_injector.load_skill_full_body(skill_name)
-            if body is None:
-                return (
-                    f"Skill '{skill_name}' not found. "
-                    f"Available: {skill_injector.build_skill_selection_info('')}"
-                )
-            return body
-
-        return [list_schemas, list_tables, get_table_details, search_tables, load_skill]
+        return [list_schemas, list_tables, get_table_details, search_tables]
 
     # ─────────────────────────────────────────────────────────────────────────
     # Agent creation
     # ─────────────────────────────────────────────────────────────────────────
 
     def _create_agent(self, tools: List):
-        """Initialise the AzureOpenAIChatClient agent."""
-        if AzureOpenAIConfig.use_api_key():
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                api_key=AzureOpenAIConfig.API_KEY,
-                api_version=AzureOpenAIConfig.API_VERSION,
-            )
-        else:
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                credential=DefaultAzureCredential(),
-                api_version=AzureOpenAIConfig.API_VERSION,
-            )
-
-        enriched_prompt = skill_injector.inject_skills_metadata(METADATA_AGENT_PROMPT)
+        """Initialise the MAF MetadataAgent."""
+        enriched_prompt = METADATA_AGENT_PROMPT
         db_context = (
             f"\n\n## Databricks Context\n"
             f"- Default catalog: `{DatabricksConfig.CATALOG}`\n"
@@ -388,13 +358,15 @@ class MetadataAgent:
         )
         enriched_prompt += db_context
 
-        agent = client.as_agent(
+        skills_provider = create_skills_provider("MetadataAgent")
+        agent = create_maf_agent(
             name="MetadataAgent",
             instructions=enriched_prompt,
             tools=tools,
-            default_options={"temperature": 0.0},
+            temperature=0.0,
+            context_providers=[skills_provider] if skills_provider else None,
         )
-        logger.info("MetadataAgent created with AzureOpenAIChatClient.")
+        logger.info("MetadataAgent created with MAF OpenAIChatCompletionClient.")
         return agent
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -403,7 +375,7 @@ class MetadataAgent:
 
     def get_new_thread(self):
         """Create a new MAF conversation thread."""
-        return self.agent.get_new_thread()
+        return create_session(self.agent)
 
     async def query(self, question: str, thread=None) -> str:
         """
@@ -411,7 +383,7 @@ class MetadataAgent:
         Returns a YAML/markdown schema context block.
         """
         logger.info(f"MetadataAgent.query: '{question[:80]}'")
-        result = await self.agent.run(question, thread=thread)
+        result = await run_agent(self.agent, question, session=thread)
         logger.info(f"MetadataAgent.query completed, len={len(result.text)}")
         logger.debug(f"MetadataAgent.query result preview:\n{result.text[:600]}")
         return result.text
@@ -419,5 +391,5 @@ class MetadataAgent:
     async def query_stream(self, question: str, thread=None):
         """Streaming version of :meth:`query`."""
         logger.info(f"MetadataAgent.query_stream: '{question[:80]}'")
-        async for update in self.agent.run_stream(question, thread=thread):
+        async for update in stream_agent(self.agent, question, session=thread):
             yield update

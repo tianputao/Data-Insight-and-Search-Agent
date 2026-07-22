@@ -3,20 +3,34 @@ Master Agent implementation using Microsoft Agent Framework.
 Follows MAF best practices for multi-turn conversations and threading.
 """
 
+from contextvars import ContextVar, copy_context
+from threading import Event
 from typing import List, Dict, Any, Optional, Annotated
 import json
 import time
 from pydantic import Field
-from agent_framework.azure import AzureOpenAIChatClient
-from azure.identity import DefaultAzureCredential
 
 from .search_agent import SearchAgent
 from .data_insight_agent import DataInsightAgent
 from .metadata_agent import MetadataAgent
-from ..prompts import MASTER_AGENT_PROMPT, MASTER_AGENT_PROMPT_BASE
-from ..config import AzureOpenAIConfig
-from ..injector import skill_injector
+from ..config import AppConfig
+from ..prompts import MASTER_AGENT_PROMPT
+from ..query_engine import QueryEngineContext
 from ..utils import get_logger
+from ..utils.activity import (
+    agent_activity,
+    narration_activity,
+    new_activity_id,
+    pipeline_activity,
+    stage_activity,
+    tool_activity,
+)
+from .maf_runtime import (
+    create_agent as create_maf_agent,
+    create_session,
+    run_agent,
+    stream_agent,
+)
 
 
 logger = get_logger(__name__)
@@ -24,7 +38,7 @@ logger = get_logger(__name__)
 
 class MasterAgent:
     """
-    Master Agent using Microsoft Agent Framework's AzureOpenAIChatClient.
+    Master Agent using Microsoft Agent Framework 1.11.
     Orchestrates knowledge retrieval and answer generation.
     Manages multi-turn conversations using agent threads.
     """
@@ -49,15 +63,376 @@ class MasterAgent:
         self.data_insight_agent = data_insight_agent
         self.metadata_agent = metadata_agent
         self.agent_id = agent_id
+        self._active_turn_context: ContextVar[Optional[QueryEngineContext]] = ContextVar(
+            f"{agent_id}_active_turn_context",
+            default=None,
+        )
 
-        # Create agent using AzureOpenAIChatClient pattern
+        # Create the MAF agent with in-memory session history.
         # In-memory message store is used by default for multi-turn conversations
         self.agent = self._create_agent()
 
         logger.info(f"MasterAgent '{agent_id}' initialized successfully")
+
+    def _turn_context_var(self) -> ContextVar[Optional[QueryEngineContext]]:
+        """Return the request-local context variable, including for lightweight tests."""
+        context_var = getattr(self, "_active_turn_context", None)
+        if context_var is None:
+            context_var = ContextVar(
+                f"{getattr(self, 'agent_id', 'master_agent')}_active_turn_context",
+                default=None,
+            )
+            self._active_turn_context = context_var
+        return context_var
+
+    def _current_turn(self) -> Optional[QueryEngineContext]:
+        return self._turn_context_var().get()
+
+    def _new_turn(
+        self,
+        message: str,
+        *,
+        stream_context: Any = None,
+        cancel_event: Optional[Event] = None,
+    ) -> QueryEngineContext:
+        return QueryEngineContext(
+            original_question=message,
+            max_search_attempts=AppConfig.QUERY_ENGINE_MAX_SEARCH_ATTEMPTS,
+            stream_context=stream_context,
+            cancel_event=cancel_event,
+        )
+
+    def _record_tool_outcome(
+        self,
+        name: str,
+        *,
+        success: bool,
+        summary: str = "",
+        retryable: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        started_at: Optional[float] = None,
+    ) -> None:
+        turn = self._current_turn()
+        if turn is None:
+            return
+        duration_ms = None
+        if started_at is not None:
+            duration_ms = round((time.perf_counter() - started_at) * 1000)
+        turn.record_tool(
+            name,
+            success=success,
+            summary=summary,
+            retryable=retryable,
+            metadata=metadata,
+            duration_ms=duration_ms,
+        )
     
     def _create_tools(self) -> List:
         """Create function tools for delegating to search agent."""
+
+        def push_stream_event(item_type: str, payload: Any) -> None:
+            turn = self._current_turn()
+            streaming_ctx = turn.stream_context if turn is not None else None
+            if streaming_ctx is None:
+                return
+            combined_q, main_loop = streaming_ctx
+            try:
+                main_loop.call_soon_threadsafe(combined_q.put_nowait, (item_type, payload))
+            except Exception as exc:
+                logger.warning(f"[streaming] queue push failed: {exc}")
+
+        def start_context_thread(target, *, daemon: bool = False):
+            """Start a child thread with the active MasterAgent turn context copied in."""
+            import threading
+
+            context = copy_context()
+            thread = threading.Thread(
+                target=lambda: context.run(target),
+                daemon=daemon,
+            )
+            thread.start()
+            return thread
+
+        def wait_for_context_thread(thread, timeout: float) -> bool:
+            """Wait for a worker while allowing a session stop to end orchestration promptly."""
+            deadline = time.monotonic() + timeout
+            while thread.is_alive():
+                turn = self._current_turn()
+                if turn is not None and turn.cancelled:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                thread.join(timeout=min(0.1, remaining))
+            return True
+
+        def start_agent_activity(
+            agent: str,
+            task: str,
+            *,
+            parent_id: Optional[str] = None,
+        ) -> tuple[str, float]:
+            activity_id = new_activity_id(agent.lower())
+            push_stream_event(
+                "activity",
+                agent_activity(
+                    activity_id,
+                    agent,
+                    task,
+                    parent_id=parent_id,
+                ),
+            )
+            return activity_id, time.perf_counter()
+
+        def start_search_activity(task: str) -> tuple[str, float, int]:
+            turn = self._current_turn()
+            turn_state = turn.progress if turn is not None else {}
+            activity_id = turn_state.get("search_agent_id")
+            started_at = turn_state.get("search_agent_started_at")
+            attempt = int(turn_state.get("search_attempts", 0)) + 1
+            if not activity_id:
+                activity_id = new_activity_id("searchagent")
+                started_at = time.perf_counter()
+                turn_state["search_agent_id"] = activity_id
+                turn_state["search_agent_started_at"] = started_at
+            turn_state["search_attempts"] = attempt
+            push_stream_event(
+                "activity",
+                agent_activity(
+                    activity_id,
+                    "SearchAgent",
+                    task,
+                    summary=f"Search attempt {attempt}",
+                    metrics={"attempts": attempt},
+                ),
+            )
+            return activity_id, float(started_at), attempt
+
+        def finish_agent_activity(
+            activity_id: str,
+            agent: str,
+            task: str,
+            started_at: float,
+            *,
+            error: bool = False,
+            summary: Optional[str] = None,
+            metrics: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            push_stream_event(
+                "activity",
+                agent_activity(
+                    activity_id,
+                    agent,
+                    task,
+                    state="error" if error else "completed",
+                    duration_ms=round((time.perf_counter() - started_at) * 1000),
+                    summary=summary,
+                    metrics=metrics,
+                ),
+            )
+
+        def push_tool_start(
+            name: str,
+            arguments: str,
+            call_id: str,
+            agent: str,
+            parent_id: str,
+        ) -> str:
+            try:
+                args = json.loads(arguments) if arguments else {}
+            except Exception:
+                args = {}
+            stable_call_id = call_id or new_activity_id("call")
+            push_stream_event(
+                "activity",
+                tool_activity(
+                    name,
+                    args,
+                    stable_call_id,
+                    agent=agent,
+                    parent_id=parent_id,
+                ),
+            )
+            return stable_call_id
+
+        def push_tool_end(
+            call_id: str,
+            name: str,
+            arguments: str,
+            agent: str,
+            parent_id: str,
+            error: bool = False,
+        ) -> None:
+            if call_id:
+                try:
+                    args = json.loads(arguments) if arguments else {}
+                except Exception:
+                    args = {}
+                activity = tool_activity(
+                    name,
+                    args,
+                    call_id,
+                    agent=agent,
+                    parent_id=parent_id,
+                )
+                activity["state"] = "error" if error else "completed"
+                push_stream_event(
+                    "activity",
+                    activity,
+                )
+
+        async def collect_nested_agent_stream(
+            stream,
+            *,
+            agent: str,
+            parent_id: str,
+            stream_final_text: bool,
+        ) -> str:
+            """Forward nested model narration and tool lifecycle without exposing private reasoning."""
+            active_text: List[str] = []
+            pending_name = ""
+            pending_args = ""
+            pending_call_id = ""
+            started_calls: Dict[str, tuple[str, str, float]] = {}
+
+            def tool_result_failed(name: str, result: Any, exception: Any) -> bool:
+                if exception:
+                    return True
+                if name != "execute_sql":
+                    return False
+                result_text = str(result or "").lower()
+                return any(
+                    marker in result_text
+                    for marker in (
+                        "query execution failed",
+                        "configuration error",
+                        "only read-only",
+                        "timed out",
+                        "sql error",
+                    )
+                )
+
+            def reclassify_text() -> None:
+                nonlocal active_text
+                raw_text = "".join(active_text)
+                active_text = []
+                text = raw_text.strip()
+                if not text:
+                    return
+                push_stream_event(
+                    "activity",
+                    narration_activity(
+                        new_activity_id("narration"),
+                        text,
+                        agent=agent,
+                        parent_id=parent_id,
+                    ),
+                )
+
+            def flush_pending() -> None:
+                nonlocal pending_call_id, pending_name, pending_args
+                if not pending_name:
+                    return
+                reclassify_text()
+                stable_call_id = push_tool_start(
+                    pending_name,
+                    pending_args,
+                    pending_call_id,
+                    agent,
+                    parent_id,
+                )
+                started_calls[stable_call_id] = (
+                    pending_name,
+                    pending_args,
+                    time.perf_counter(),
+                )
+                pending_name = ""
+                pending_args = ""
+                pending_call_id = ""
+
+            try:
+                async for update in stream:
+                    if hasattr(update, "text") and update.text:
+                        active_text.append(update.text)
+
+                    if not (hasattr(update, "contents") and update.contents):
+                        continue
+
+                    for content in update.contents:
+                        content_type = getattr(content, "type", None)
+                        if content_type == "text_reasoning":
+                            reasoning_text = (getattr(content, "text", "") or "").strip()
+                            if reasoning_text:
+                                push_stream_event(
+                                    "activity",
+                                    {
+                                        "id": new_activity_id("reasoning"),
+                                        "kind": "reasoning",
+                                        "category": "reasoning",
+                                        "state": "completed",
+                                        "agent": agent,
+                                        "parent_id": parent_id,
+                                        "message": reasoning_text,
+                                    },
+                                )
+                        elif content_type == "function_call":
+                            name = getattr(content, "name", "") or ""
+                            arguments = getattr(content, "arguments", "") or ""
+                            if name and name != pending_name:
+                                flush_pending()
+                                pending_name = name
+                                pending_call_id = getattr(content, "call_id", "") or ""
+                                pending_args = arguments
+                            else:
+                                pending_args += arguments
+
+                            if pending_args:
+                                try:
+                                    json.loads(pending_args)
+                                    flush_pending()
+                                except json.JSONDecodeError:
+                                    pass
+                        elif content_type == "function_result":
+                            flush_pending()
+                            call_id = getattr(content, "call_id", "") or ""
+                            call_info = started_calls.get(call_id)
+                            if call_info:
+                                name, arguments, tool_started_at = call_info
+                                result_payload = getattr(content, "result", None)
+                                exception = getattr(content, "exception", None)
+                                failed = tool_result_failed(
+                                    name,
+                                    result_payload,
+                                    exception,
+                                )
+                                push_tool_end(
+                                    call_id,
+                                    name,
+                                    arguments,
+                                    agent,
+                                    parent_id,
+                                    error=failed,
+                                )
+                                self._record_tool_outcome(
+                                    name,
+                                    success=not failed,
+                                    summary=(
+                                        str(exception or result_payload or "")[:1000]
+                                    ),
+                                    metadata={"agent": agent},
+                                    started_at=tool_started_at,
+                                )
+                flush_pending()
+            finally:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+
+            final_text = "".join(active_text)
+            if stream_final_text and final_text:
+                push_stream_event("text", final_text)
+            return final_text.strip()
         
         def decompose_query(
             original_query: Annotated[str, Field(description="The original user question to decompose")],
@@ -69,6 +444,7 @@ class MasterAgent:
             Returns a list of sub-queries that can be searched independently.
             """
             logger.info(f"[Tool] decompose_query called for: '{original_query}' (num_subqueries={num_subqueries})")
+            tool_started_at = time.perf_counter()
             
             # Use LLM to decompose the query
             decomposition_prompt = f"""Analyze this question and break it down into {num_subqueries} focused, independent sub-questions that together cover all aspects of the original question.
@@ -77,34 +453,44 @@ Original Question: {original_query}
 
 Requirements:
 1. Each sub-question should be specific and independently searchable
-2. Sub-questions should cover different aspects of the main question  
-3. Use clear, concise language
-4. Include relevant keywords and technical terms
-5. Return ONLY the sub-questions, numbered 1-{num_subqueries}
+2. Correct ambiguous wording, spelling, abbreviations, and likely terminology errors
+3. Enrich each query with relevant synonyms, formal names, and domain terminology
+4. Sub-questions should cover different aspects without unnecessary overlap
+5. Preserve every constraint and comparison requested by the user
+6. Return ONLY the final search-ready sub-questions, numbered 1-{num_subqueries}
 
 Sub-questions:"""
             
             try:
-                from agent_framework.messages import TextMessage
-                
-                # Create temporary thread for decomposition
-                temp_thread = self.agent.create_thread()
-                response = self.agent.send_message(
-                    TextMessage(content=decomposition_prompt),
-                    thread_id=temp_thread.id
+                import asyncio
+
+                decomposition_agent = create_maf_agent(
+                    name="QueryDecompositionAgent",
+                    instructions="Decompose the supplied question exactly as requested.",
+                    tools=[],
+                    temperature=0.1,
                 )
-                
-                # Extract sub-queries from response
-                subqueries_text = ""
-                for update in response:
-                    if hasattr(update, 'text') and update.text:
-                        subqueries_text += update.text
+                response = asyncio.run(run_agent(decomposition_agent, decomposition_prompt))
+                subqueries_text = response.text
                 
                 logger.info(f"[Tool] Query decomposed into:\\n{subqueries_text}")
+                self._record_tool_outcome(
+                    "decompose_query",
+                    success=bool(subqueries_text.strip()),
+                    summary=f"Prepared {num_subqueries} search-ready subqueries",
+                    metadata={"subquery_count": num_subqueries},
+                    started_at=tool_started_at,
+                )
                 return f"Successfully decomposed query. Sub-queries:\\n{subqueries_text}"
                 
             except Exception as e:
                 logger.error(f"[Tool] decompose_query failed: {e}", exc_info=True)
+                self._record_tool_outcome(
+                    "decompose_query",
+                    success=False,
+                    summary=str(e),
+                    started_at=tool_started_at,
+                )
                 return f"Failed to decompose query: {str(e)}"
         
         def search_multiple_queries(
@@ -113,15 +499,59 @@ Sub-questions:"""
             """
             Execute multiple search queries in parallel and return aggregated results.
             Use this for complex questions that have been decomposed into sub-queries.
+            Before calling, emit a user-visible working sentence that explicitly names SearchAgent
+            and explains why these sub-queries are being delegated.
             Returns formatted results from all searches with citations.
             """
             logger.info(f"[Tool] search_multiple_queries called with {len(queries)} queries: {queries}")
+            tool_started_at = time.perf_counter()
+            turn = self._current_turn()
+            turn_state = turn.progress if turn is not None else {}
+            search_limit = (
+                turn.max_search_attempts
+                if turn is not None
+                else AppConfig.QUERY_ENGINE_MAX_SEARCH_ATTEMPTS
+            )
+            if int(turn_state.get("search_attempts", 0)) >= search_limit:
+                self._record_tool_outcome(
+                    "search_multiple_queries",
+                    success=False,
+                    retryable=False,
+                    summary="Search attempt limit reached",
+                    metadata={"query_count": len(queries)},
+                    started_at=tool_started_at,
+                )
+                return (
+                    "SearchAgent has reached the configured retrieval-attempt limit. "
+                    "Use the available evidence and clearly acknowledge any remaining gap."
+                )
+            agent_activity_id, agent_started_at, search_attempt = start_search_activity(
+                "\n".join(queries[:5])
+            )
             
             import asyncio
-            import threading
             
             # Container for all results
             all_results = {"results": [], "error": None}
+
+            def report_parallel_progress(progress: Dict[str, Any]) -> None:
+                stage = str(progress.get("stage") or "parallel_search")
+                metrics = progress.get("metrics") if isinstance(progress.get("metrics"), dict) else {}
+                if progress.get("query_index"):
+                    metrics = {**metrics, "query_index": progress["query_index"]}
+                push_stream_event(
+                    "activity",
+                    stage_activity(
+                        f"{agent_activity_id}-attempt-{search_attempt}-{stage}",
+                        agent_activity_id,
+                        "SearchAgent",
+                        str(progress.get("message") or stage.replace("_", " ").title()),
+                        state=str(progress.get("state") or "running"),
+                        detail=progress.get("detail"),
+                        category=str(progress.get("category") or "search"),
+                        metrics=metrics,
+                    ),
+                )
             
             def run_parallel_searches():
                 try:
@@ -130,7 +560,10 @@ Sub-questions:"""
                     try:
                         # Execute all searches in parallel
                         results_list = loop.run_until_complete(
-                            self.search_agent.search_tool.parallel_search(queries)
+                            self.search_agent.search_tool.parallel_search(
+                                queries,
+                                progress_callback=report_parallel_progress,
+                            )
                         )
                         all_results["results"] = results_list
                     finally:
@@ -139,25 +572,90 @@ Sub-questions:"""
                     all_results["error"] = e
             
             # Run in separate thread
-            thread = threading.Thread(target=run_parallel_searches)
-            thread.start()
-            thread.join(timeout=60)  # 60 second timeout for multiple queries
+            thread = start_context_thread(run_parallel_searches, daemon=True)
+            thread_finished = wait_for_context_thread(thread, 60)
             
-            if thread.is_alive():
+            if not thread_finished:
+                turn = self._current_turn()
+                if turn is not None and turn.cancelled:
+                    return "Search cancelled by user."
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    "\n".join(queries[:5]),
+                    agent_started_at,
+                    error=True,
+                    summary="Parallel search timed out",
+                )
+                self._record_tool_outcome(
+                    "search_multiple_queries",
+                    success=False,
+                    summary="Parallel search timed out",
+                    metadata={"query_count": len(queries)},
+                    started_at=tool_started_at,
+                )
                 return "Search timeout: The parallel search operation took too long."
             
             if all_results["error"]:
                 error_msg = str(all_results["error"])
                 logger.error(f"[Tool] search_multiple_queries failed: {error_msg}", exc_info=True)
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    "\n".join(queries[:5]),
+                    agent_started_at,
+                    error=True,
+                    summary=error_msg[:160],
+                )
+                self._record_tool_outcome(
+                    "search_multiple_queries",
+                    success=False,
+                    summary=error_msg,
+                    metadata={"query_count": len(queries)},
+                    started_at=tool_started_at,
+                )
                 return f"Parallel search error: {error_msg}"
             
             results_list = all_results["results"]
             
             if not results_list or all(len(r) == 0 for r in results_list):
                 logger.warning(f"[Tool] No results found for any query")
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    "\n".join(queries[:5]),
+                    agent_started_at,
+                    summary="No relevant documents found",
+                    metrics={"query_count": len(queries), "selected_count": 0},
+                )
+                self._record_tool_outcome(
+                    "search_multiple_queries",
+                    success=False,
+                    summary="No relevant documents found for the subqueries",
+                    metadata={"query_count": len(queries), "selected_count": 0},
+                    started_at=tool_started_at,
+                )
                 return "No relevant documents found for any of the sub-queries."
             
             # Aggregate and deduplicate results
+            aggregation_stage_id = (
+                f"{agent_activity_id}-attempt-{search_attempt}-aggregate_results"
+            )
+            push_stream_event(
+                "activity",
+                stage_activity(
+                    aggregation_stage_id,
+                    agent_activity_id,
+                    "SearchAgent",
+                    "Aggregate unique documents",
+                    detail="Merge parallel result sets and remove duplicate document IDs",
+                    category="filtering",
+                    metrics={
+                        "query_count": len(queries),
+                        "raw_result_count": sum(len(result_set) for result_set in results_list),
+                    },
+                ),
+            )
             seen_ids = set()
             aggregated_results = []
             citation_counter = 1
@@ -172,6 +670,24 @@ Sub-questions:"""
                         result['citation_number'] = citation_counter
                         aggregated_results.append(result)
                         citation_counter += 1
+
+            push_stream_event(
+                "activity",
+                stage_activity(
+                    aggregation_stage_id,
+                    agent_activity_id,
+                    "SearchAgent",
+                    "Aggregate unique documents",
+                    state="completed",
+                    detail="Merge parallel result sets and remove duplicate document IDs",
+                    category="filtering",
+                    metrics={
+                        "query_count": len(queries),
+                        "raw_result_count": sum(len(result_set) for result_set in results_list),
+                        "selected_count": len(aggregated_results),
+                    },
+                ),
+            )
             
             logger.info(f"[Tool] Aggregated {len(aggregated_results)} unique results from {len(queries)} queries")
             
@@ -195,6 +711,28 @@ Sub-questions:"""
                 formatted_results.append(f"Source: {url}\\n")
             
             result_text = "\\n".join(formatted_results)
+            finish_agent_activity(
+                agent_activity_id,
+                "SearchAgent",
+                "\n".join(queries[:5]),
+                agent_started_at,
+                summary=f"Selected {len(aggregated_results)} unique documents",
+                metrics={
+                    "query_count": len(queries),
+                    "selected_count": len(aggregated_results),
+                    "attempts": search_attempt,
+                },
+            )
+            self._record_tool_outcome(
+                "search_multiple_queries",
+                success=True,
+                summary=f"Selected {len(aggregated_results)} unique documents",
+                metadata={
+                    "query_count": len(queries),
+                    "selected_count": len(aggregated_results),
+                },
+                started_at=tool_started_at,
+            )
             logger.info(f"[Tool] search_multiple_queries completed: {len(result_text)} chars")
             return result_text
         
@@ -204,24 +742,39 @@ Sub-questions:"""
             """
             Search the enterprise knowledge base for relevant information.
             Use this tool when you need to find information to answer user questions.
+            Before calling, emit a user-visible working sentence that explicitly names SearchAgent
+            and explains what evidence it should retrieve.
             For simple, focused questions only. For complex questions, use decompose_query first.
             Returns formatted search results with citations and image URLs when available.
             """
             logger.info(f"[Tool] search_knowledge called with query: '{query}'")
+            tool_started_at = time.perf_counter()
+            turn = self._current_turn()
+            turn_state = turn.progress if turn is not None else {}
+            search_limit = (
+                turn.max_search_attempts
+                if turn is not None
+                else AppConfig.QUERY_ENGINE_MAX_SEARCH_ATTEMPTS
+            )
+            if int(turn_state.get("search_attempts", 0)) >= search_limit:
+                logger.warning("SearchAgent attempt limit reached; reusing the latest search result.")
+                self._record_tool_outcome(
+                    "search_knowledge",
+                    success=False,
+                    retryable=False,
+                    summary="Search attempt limit reached",
+                    started_at=tool_started_at,
+                )
+                return turn_state.get("last_search_result") or (
+                    "SearchAgent has already completed two retrieval attempts for this turn. "
+                    "Use the available evidence and acknowledge any remaining gap."
+                )
+            agent_activity_id, agent_started_at, search_attempt = start_search_activity(query)
 
             import asyncio
             import threading
 
-            # Push thinking steps via the combined streaming queue (same as delegate_data_insight)
-            streaming_ctx = getattr(self, "_insight_streaming", None)
-
-            def _push_think(msg: str):
-                if streaming_ctx is not None:
-                    combined_q, ml = streaming_ctx
-                    try:
-                        ml.call_soon_threadsafe(combined_q.put_nowait, ("thinking", msg))
-                    except Exception:
-                        pass
+            streaming_ctx = turn.stream_context if turn is not None else None
 
             def _push_refs(refs: Dict[str, tuple[str, str]]):
                 if streaming_ctx is not None and refs:
@@ -233,45 +786,101 @@ Sub-questions:"""
 
             result_container: Dict[str, Any] = {"result": None, "error": None}
 
+            def report_search_progress(progress: Dict[str, Any]) -> None:
+                stage = str(progress.get("stage") or "search")
+                push_stream_event(
+                    "activity",
+                    stage_activity(
+                        f"{agent_activity_id}-attempt-{search_attempt}-{stage}",
+                        agent_activity_id,
+                        "SearchAgent",
+                        str(progress.get("message") or stage.replace("_", " ").title()),
+                        state=str(progress.get("state") or "running"),
+                        detail=progress.get("detail"),
+                        category=str(progress.get("category") or "search"),
+                        metrics=progress.get("metrics") if isinstance(progress.get("metrics"), dict) else {},
+                    ),
+                )
+
             def run_async_search():
-                _push_think(f"🔍 [MasterAgent → SearchAgent] 知识库检索: {query}")
                 try:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     try:
                         results_dict = loop.run_until_complete(
-                            self.search_agent.search_knowledge_base(query)
+                            self.search_agent.search_knowledge_base(
+                                query,
+                                progress_callback=report_search_progress,
+                            )
                         )
                         result_container["result"] = results_dict
-                        # Push search sub-steps one-by-one with a small delay so the
-                        # frontend renders them progressively rather than all at once.
-                        for step in results_dict.get("thinking_log", []):
-                            _push_think(step)
-                            time.sleep(0.35)
-                        count = len(results_dict.get("results") or [])
-                        if count:
-                            time.sleep(0.35)
-                            _push_think(f"✅ [SearchAgent] 检索到 {count} 条文档")
                     finally:
                         loop.close()
                 except Exception as e:
                     result_container["error"] = e
 
-            thread = threading.Thread(target=run_async_search)
-            thread.start()
-            thread.join(timeout=30)
+            thread = start_context_thread(run_async_search, daemon=True)
+            thread_finished = wait_for_context_thread(thread, 30)
 
-            if thread.is_alive():
+            if not thread_finished:
+                turn = self._current_turn()
+                if turn is not None and turn.cancelled:
+                    return "Search cancelled by user."
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    query,
+                    agent_started_at,
+                    error=True,
+                    summary="Knowledge search timed out",
+                )
+                self._record_tool_outcome(
+                    "search_knowledge",
+                    success=False,
+                    summary="Knowledge search timed out",
+                    metadata={"query": query},
+                    started_at=tool_started_at,
+                )
                 return "Search timeout: The search operation took too long to complete."
 
             if result_container["error"]:
                 logger.error(f"[Tool] search_knowledge failed", exc_info=result_container["error"])
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    query,
+                    agent_started_at,
+                    error=True,
+                    summary=str(result_container["error"])[:160],
+                )
+                self._record_tool_outcome(
+                    "search_knowledge",
+                    success=False,
+                    summary=str(result_container["error"]),
+                    metadata={"query": query},
+                    started_at=tool_started_at,
+                )
                 return f"An error occurred while searching: {str(result_container['error'])}"
 
             results_dict = result_container["result"]
 
             if not results_dict or not results_dict.get("results"):
                 logger.warning(f"[Tool] search_knowledge: No results found")
+                finish_agent_activity(
+                    agent_activity_id,
+                    "SearchAgent",
+                    query,
+                    agent_started_at,
+                    summary="No relevant documents found",
+                    metrics={"selected_count": 0},
+                )
+                self._record_tool_outcome(
+                    "search_knowledge",
+                    success=False,
+                    summary="No relevant documents found",
+                    metadata={"query": query, "selected_count": 0},
+                    started_at=tool_started_at,
+                )
                 return "No relevant documents found in the knowledge base for this query."
 
             results = results_dict["results"]
@@ -320,7 +929,28 @@ Sub-questions:"""
                     refs_map[citation_id] = (str(title).strip() or f"Reference {citation_id}", str(url).strip())
 
             result_text = "\n".join(formatted_parts)
+            turn_state["last_search_result"] = result_text
             _push_refs(refs_map)
+            finish_agent_activity(
+                agent_activity_id,
+                "SearchAgent",
+                query,
+                agent_started_at,
+                summary=f"Selected {len(results)} relevant documents",
+                metrics={
+                    "selected_count": len(results),
+                    "attempts": search_attempt,
+                    "semantic_ranking": self.search_agent.search_tool.enable_semantic_reranker,
+                    "agentic_retrieval": self.search_agent.search_tool.enable_agentic_retrieval,
+                },
+            )
+            self._record_tool_outcome(
+                "search_knowledge",
+                success=True,
+                summary=f"Selected {len(results)} relevant documents",
+                metadata={"query": query, "selected_count": len(results)},
+                started_at=tool_started_at,
+            )
             logger.info(f"[Tool] search_knowledge completed: {len(results)} results, {len(result_text)} chars")
             # Return plain result text — thinking steps already pushed in real-time above
             return result_text
@@ -335,29 +965,35 @@ Sub-questions:"""
         ) -> str:
             """
             Delegate a metadata/schema question to MetadataAgent.
+            Before calling, emit a user-visible working sentence that explicitly names MetadataAgent
+            and explains which business concepts, tables, or fields it should establish.
             Use this when:
             - The user asks about table structures, column names, or data descriptions.
             - DataInsightAgent needs schema context before writing a query.
             Returns a YAML/markdown schema summary from Unity Catalog.
             """
             logger.info(f"[Tool] delegate_metadata called: '{question[:80]}'")
+            tool_started_at = time.perf_counter()
 
             if self.metadata_agent is None:
+                self._record_tool_outcome(
+                    "delegate_metadata",
+                    success=False,
+                    retryable=False,
+                    summary="MetadataAgent is not available",
+                    started_at=tool_started_at,
+                )
                 return "MetadataAgent is not available. Please ensure it is initialised."
 
-            # Push thinking steps into the combined queue if streaming is active
-            streaming_ctx = getattr(self, "_insight_streaming", None)
-
-            def _push_think(msg: str):
-                if streaming_ctx is not None:
-                    combined_q, ml = streaming_ctx
-                    try:
-                        ml.call_soon_threadsafe(combined_q.put_nowait, ("thinking", msg))
-                    except Exception:
-                        pass
-
-            _push_think(f"🗂️ [MetadataAgent] 开始查询数据结构: {question[:60]}")
-
+            agent_activity_id, agent_started_at = start_agent_activity(
+                "MetadataAgent",
+                question,
+                parent_id=(
+                    self._current_turn().progress.get("data_pipeline_activity_id")
+                    if self._current_turn() is not None
+                    else None
+                ),
+            )
             result_container: Dict[str, Any] = {"result": None, "error": None}
 
             def _run():
@@ -365,71 +1001,14 @@ Sub-questions:"""
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    async def collect() -> str:
-                        text_parts: List[str] = []
-                        pending_name: str = ""
-                        pending_args: str = ""
-
-                        def _flush_pending() -> None:
-                            nonlocal pending_name, pending_args
-                            if not pending_name:
-                                return
-                            try:
-                                args = json.loads(pending_args) if pending_args else {}
-                            except Exception:
-                                args = {}
-
-                            if pending_name == "load_skill":
-                                _push_think(
-                                    f"📖 [MetadataAgent] 加载业务规则: {args.get('skill_name', '')}"
-                                )
-
-                            pending_name = ""
-                            pending_args = ""
-
-                        stream = self.metadata_agent.query_stream(question)
-                        try:
-                            async for update in stream:
-                                if hasattr(update, "text") and update.text:
-                                    text_parts.append(update.text)
-
-                                if not (hasattr(update, "contents") and update.contents):
-                                    continue
-
-                                for content in update.contents:
-                                    ct = getattr(content, "type", None)
-
-                                    if ct == "function_call":
-                                        tname = getattr(content, "name", "") or ""
-                                        targs = getattr(content, "arguments", "") or ""
-
-                                        if tname and tname != pending_name:
-                                            _flush_pending()
-                                            pending_name = tname
-                                            pending_args = targs
-                                        else:
-                                            pending_args += targs
-
-                                        if pending_args:
-                                            try:
-                                                json.loads(pending_args)
-                                                _flush_pending()
-                                            except json.JSONDecodeError:
-                                                pass
-
-                                    elif ct == "function_result":
-                                        _flush_pending()
-
-                            _flush_pending()
-                        finally:
-                            try:
-                                await stream.aclose()
-                            except Exception:
-                                pass
-
-                        return "".join(text_parts).strip()
-
-                    result_container["result"] = loop.run_until_complete(collect())
+                    result_container["result"] = loop.run_until_complete(
+                        collect_nested_agent_stream(
+                            self.metadata_agent.query_stream(question),
+                            agent="MetadataAgent",
+                            parent_id=agent_activity_id,
+                            stream_final_text=False,
+                        )
+                    )
                 except Exception as exc:
                     result_container["error"] = exc
                 finally:
@@ -441,20 +1020,66 @@ Sub-questions:"""
                     loop.run_until_complete(loop.shutdown_asyncgens())
                     loop.close()
 
-            import threading as _threading
-            t = _threading.Thread(target=_run)
-            t.start()
-            t.join(timeout=90)
+            t = start_context_thread(_run, daemon=True)
+            thread_finished = wait_for_context_thread(t, 90)
 
-            if t.is_alive():
+            if not thread_finished:
+                turn = self._current_turn()
+                if turn is not None and turn.cancelled:
+                    return "Metadata lookup cancelled by user."
+                finish_agent_activity(
+                    agent_activity_id,
+                    "MetadataAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary="Metadata lookup timed out",
+                )
+                self._record_tool_outcome(
+                    "delegate_metadata",
+                    success=False,
+                    summary="Metadata lookup timed out",
+                    started_at=tool_started_at,
+                )
                 return "Metadata lookup timed out."
             if result_container["error"]:
-                _push_think(f"❌ [MetadataAgent] 查询失败: {result_container['error']}")
+                finish_agent_activity(
+                    agent_activity_id,
+                    "MetadataAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=str(result_container["error"])[:160],
+                )
+                self._record_tool_outcome(
+                    "delegate_metadata",
+                    success=False,
+                    summary=str(result_container["error"]),
+                    started_at=tool_started_at,
+                )
                 return f"MetadataAgent error: {result_container['error']}"
-            _push_think("✅ [MetadataAgent] 数据结构查询完成")
-            return result_container["result"] or "No metadata returned."
+            finish_agent_activity(
+                agent_activity_id,
+                "MetadataAgent",
+                question,
+                agent_started_at,
+                summary="Step 1 completed: schema context prepared",
+            )
+            metadata_result = result_container["result"] or "No metadata returned."
+            self._record_tool_outcome(
+                "delegate_metadata",
+                success=metadata_result != "No metadata returned.",
+                summary=(
+                    "Relevant schema context prepared"
+                    if metadata_result != "No metadata returned."
+                    else metadata_result
+                ),
+                metadata={"result_chars": len(metadata_result)},
+                started_at=tool_started_at,
+            )
+            return metadata_result
 
-        def delegate_data_insight(
+        def _run_data_insight(
             question: Annotated[
                 str,
                 Field(description="The data analysis question to send to DataInsightAgent"),
@@ -466,128 +1091,70 @@ Sub-questions:"""
         ) -> str:
             """
             Delegate a data analysis question to DataInsightAgent.
+            Before calling, emit a user-visible working sentence that explicitly names DataInsightAgent
+            and cites the schema evidence that enables the analysis.
             Use this when the user asks for data queries, analytics, KPIs, trends, or statistics
             from Azure Databricks Delta tables.
             For best results, first call delegate_metadata to retrieve relevant schema context
             and pass it as schema_context.
             Returns formatted query results and analytical insights.
             """
-            logger.info(f"[Tool] delegate_data_insight called: '{question[:80]}'")
+            logger.info(f"[Pipeline] DataInsightAgent starting: '{question[:80]}'")
+            tool_started_at = time.perf_counter()
 
             if self.data_insight_agent is None:
+                self._record_tool_outcome(
+                    "data_insight",
+                    success=False,
+                    retryable=False,
+                    summary="DataInsightAgent is not available",
+                    started_at=tool_started_at,
+                )
                 return "DataInsightAgent is not available. Please ensure it is initialised."
 
-            # ── Streaming bridge ─────────────────────────────────────────────
-            streaming_ctx = getattr(self, "_insight_streaming", None)
-            if streaming_ctx is not None:
-                combined_q, main_loop = streaming_ctx
-
-                def push(item_type: str, item_data):
-                    """Thread-safe push into the combined asyncio queue on the main event loop."""
-                    try:
-                        main_loop.call_soon_threadsafe(combined_q.put_nowait, (item_type, item_data))
-                    except Exception as exc:
-                        logger.warning(f"[delegate_data_insight] queue push failed: {exc}")
-            else:
-                def push(item_type: str, item_data): pass  # non-streaming fallback
-
-            result_parts: List[str] = []
+            agent_activity_id, agent_started_at = start_agent_activity(
+                "DataInsightAgent",
+                question,
+                parent_id=(
+                    self._current_turn().progress.get("data_pipeline_activity_id")
+                    if self._current_turn() is not None
+                    else None
+                ),
+            )
             error_container: Dict[str, Any] = {"error": None}
-            original_user_question = (getattr(self, "_current_user_message", "") or "").strip()
+            result_container: Dict[str, str] = {"result": ""}
+            turn = self._current_turn()
+            original_user_question = (
+                turn.original_question.strip()
+                if turn is not None
+                else (getattr(self, "_current_user_message", "") or "").strip()
+            )
 
             def _run():
                 import asyncio as _asyncio
                 loop = _asyncio.new_event_loop()
                 _asyncio.set_event_loop(loop)
                 try:
-                    push("thinking", "🤖 [DataInsightAgent] 开始数据分析…")
-
-                    async def collect():
-                        # Track pending function_call to accumulate streaming arg deltas
-                        pending_name: str = ""
-                        pending_args: str = ""
-                        downstream_question = question
-                        if original_user_question:
-                            downstream_question = (
-                                f"<original_user_question>\n{original_user_question}\n</original_user_question>\n\n"
-                                f"<delegated_question>\n{question}\n</delegated_question>"
-                            )
-                        stream = self.data_insight_agent.query_stream(
-                            downstream_question, schema_context=schema_context
+                    downstream_question = question
+                    if original_user_question:
+                        downstream_question = (
+                            f"<original_user_question>\n{original_user_question}\n</original_user_question>\n\n"
+                            f"<delegated_question>\n{question}\n</delegated_question>"
                         )
-
-                        def _flush_pending() -> None:
-                            nonlocal pending_name, pending_args
-                            if not pending_name:
-                                return
-                            try:
-                                args = json.loads(pending_args) if pending_args else {}
-                            except Exception:
-                                args = {}
-                            if pending_name == "execute_sql":
-                                sql = args.get("sql", "").strip()
-                                if sql:
-                                    push("thinking", f"⚡ [DataInsightAgent] 执行 SQL:\n```sql\n{sql}\n```")
-                                else:
-                                    push("thinking", "⚡ [DataInsightAgent] 执行 SQL…")
-                            elif pending_name == "get_relevant_tables":
-                                q = args.get("question", "")[:80]
-                                push("thinking", f"🗂️ [DataInsightAgent → MetadataAgent] 查找相关数据表: {q}")
-                            elif pending_name == "load_skill":
-                                push("thinking", f"📖 [DataInsightAgent] 加载业务规则: {args.get('skill_name', '')}")
-                            pending_name = ""
-                            pending_args = ""
-
-                        try:
-                            async for update in stream:
-                                # Stream text deltas directly to the frontend
-                                if hasattr(update, "text") and update.text:
-                                    result_parts.append(update.text)
-                                    push("text", update.text)
-
-                                if not (hasattr(update, "contents") and update.contents):
-                                    continue
-
-                                for content in update.contents:
-                                    ct = getattr(content, "type", None)
-
-                                    if ct == "function_call":
-                                        tname = getattr(content, "name", "") or ""
-                                        targs = getattr(content, "arguments", "") or ""
-
-                                        if tname and tname != pending_name:
-                                            # New call started — flush previous
-                                            _flush_pending()
-                                            pending_name = tname
-                                            pending_args = targs
-                                        else:
-                                            # Same call — accumulate args delta
-                                            pending_args += targs
-
-                                        # Try to flush if args are complete JSON
-                                        if pending_args:
-                                            try:
-                                                json.loads(pending_args)
-                                                _flush_pending()
-                                            except json.JSONDecodeError:
-                                                pass  # still streaming
-
-                                    elif ct == "function_result":
-                                        # Flush any remaining pending call on result
-                                        _flush_pending()
-
-                            # Final flush
-                            _flush_pending()
-                        finally:
-                            try:
-                                await stream.aclose()
-                            except Exception:
-                                pass
-
-                    loop.run_until_complete(collect())
+                    result_container["result"] = loop.run_until_complete(
+                        collect_nested_agent_stream(
+                            self.data_insight_agent.query_stream(
+                                downstream_question,
+                                schema_context=schema_context,
+                            ),
+                            agent="DataInsightAgent",
+                            parent_id=agent_activity_id,
+                            stream_final_text=True,
+                        )
+                    )
                 except Exception as exc:
                     error_container["error"] = exc
-                    logger.error(f"[delegate_data_insight] streaming error: {exc}", exc_info=True)
+                    logger.error(f"[data_analysis_pipeline] streaming error: {exc}", exc_info=True)
                 finally:
                     # No None sentinel — main loop stays alive until master signals "done"
                     pending = [task for task in _asyncio.all_tasks(loop) if not task.done()]
@@ -598,50 +1165,185 @@ Sub-questions:"""
                     loop.run_until_complete(loop.shutdown_asyncgens())
                     loop.close()
 
-            import threading as _threading
-            t = _threading.Thread(target=_run, daemon=True)
-            t.start()
-            t.join(timeout=180)
+            t = start_context_thread(_run, daemon=True)
+            thread_finished = wait_for_context_thread(t, 180)
 
-            if t.is_alive():
+            if not thread_finished:
+                turn = self._current_turn()
+                if turn is not None and turn.cancelled:
+                    return "DataInsight query cancelled by user."
+                finish_agent_activity(
+                    agent_activity_id,
+                    "DataInsightAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary="Data analysis timed out",
+                )
+                self._record_tool_outcome(
+                    "data_insight",
+                    success=False,
+                    summary="Data analysis timed out",
+                    started_at=tool_started_at,
+                )
                 return "DataInsight query timed out (180 s)."
             if error_container["error"]:
+                finish_agent_activity(
+                    agent_activity_id,
+                    "DataInsightAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=str(error_container["error"])[:160],
+                )
+                self._record_tool_outcome(
+                    "data_insight",
+                    success=False,
+                    summary=str(error_container["error"]),
+                    started_at=tool_started_at,
+                )
                 return f"DataInsightAgent error: {error_container['error']}"
 
-            result = "".join(result_parts).strip()
+            result = result_container["result"].strip()
             if not result:
+                finish_agent_activity(
+                    agent_activity_id,
+                    "DataInsightAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary="No analysis result returned",
+                )
+                self._record_tool_outcome(
+                    "data_insight",
+                    success=False,
+                    summary="DataInsightAgent returned no results",
+                    started_at=tool_started_at,
+                )
                 return "DataInsightAgent returned no results."
 
+            finish_agent_activity(
+                agent_activity_id,
+                "DataInsightAgent",
+                question,
+                agent_started_at,
+                summary="Step 2 completed: SQL analysis completed",
+            )
+            self._record_tool_outcome(
+                "data_insight",
+                success=True,
+                summary="DataInsightAgent completed the analysis",
+                metadata={"result_chars": len(result)},
+                started_at=tool_started_at,
+            )
             return "[STREAMED] DataInsightAgent has completed analysis and streamed the full result to the user."
 
-        return [decompose_query, search_multiple_queries, search_knowledge, delegate_metadata, delegate_data_insight]
+        def delegate_data_analysis(
+            question: Annotated[
+                str,
+                Field(
+                    description=(
+                        "The complete data-analysis question. This deterministic pipeline first "
+                        "retrieves schema context with MetadataAgent, then immediately delegates "
+                        "the same question and schema context to DataInsightAgent."
+                    )
+                ),
+            ]
+        ) -> str:
+            """Run the required MetadataAgent → DataInsightAgent pipeline without another MasterAgent turn."""
+            logger.info(f"[Tool] delegate_data_analysis called: '{question[:80]}'")
+            tool_started_at = time.perf_counter()
+            pipeline_id = new_activity_id("data-pipeline")
+            push_stream_event("activity", pipeline_activity(pipeline_id, question))
+            turn = self._current_turn()
+            previous_pipeline_id = None
+            if turn is not None:
+                previous_pipeline_id = turn.progress.get("data_pipeline_activity_id")
+                turn.progress["data_pipeline_activity_id"] = pipeline_id
+
+            try:
+                metadata_result = delegate_metadata(question)
+                if turn is not None and turn.cancelled:
+                    push_stream_event(
+                        "activity",
+                        pipeline_activity(
+                            pipeline_id,
+                            question,
+                            state="error",
+                            duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
+                            summary="Stopped by user after MetadataAgent",
+                        ),
+                    )
+                    return "Data-analysis pipeline cancelled by user."
+                if metadata_result.startswith("MetadataAgent error:") or metadata_result in {
+                    "Metadata lookup timed out.",
+                    "MetadataAgent is not available. Please ensure it is initialised.",
+                    "No metadata returned.",
+                }:
+                    self._record_tool_outcome(
+                        "delegate_data_analysis",
+                        success=False,
+                        summary=metadata_result,
+                        started_at=tool_started_at,
+                    )
+                    push_stream_event(
+                        "activity",
+                        pipeline_activity(
+                            pipeline_id,
+                            question,
+                            state="error",
+                            duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
+                            summary="Stopped after MetadataAgent failed",
+                        ),
+                    )
+                    return metadata_result
+
+                result = _run_data_insight(question, schema_context=metadata_result)
+                success = result.startswith("[STREAMED]")
+                self._record_tool_outcome(
+                    "delegate_data_analysis",
+                    success=success,
+                    summary=("Data-analysis pipeline completed" if success else result),
+                    started_at=tool_started_at,
+                )
+                push_stream_event(
+                    "activity",
+                    pipeline_activity(
+                        pipeline_id,
+                        question,
+                        state="completed" if success else "error",
+                        duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
+                        summary=(
+                            "MetadataAgent → DataInsightAgent completed in sequence"
+                            if success
+                            else "DataInsightAgent did not complete"
+                        ),
+                    ),
+                )
+                return result
+            finally:
+                if turn is not None:
+                    if previous_pipeline_id is None:
+                        turn.progress.pop("data_pipeline_activity_id", None)
+                    else:
+                        turn.progress["data_pipeline_activity_id"] = previous_pipeline_id
+
+        return [
+            decompose_query,
+            search_multiple_queries,
+            search_knowledge,
+            delegate_metadata,
+            delegate_data_analysis,
+        ]
 
     def _create_agent(self):
-        """Create and return the MAF AzureOpenAIChatClient agent."""
+        """Create and return the MAF MasterAgent."""
         tools = self._create_tools()
-
-        # Use API key or credential-based authentication
-        if AzureOpenAIConfig.use_api_key():
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                api_key=AzureOpenAIConfig.API_KEY,
-                api_version=AzureOpenAIConfig.API_VERSION
-            )
-        else:
-            client = AzureOpenAIChatClient(
-                endpoint=AzureOpenAIConfig.ENDPOINT,
-                deployment_name=AzureOpenAIConfig.GPT_DEPLOYMENT,
-                credential=DefaultAzureCredential(),
-                api_version=AzureOpenAIConfig.API_VERSION
-            )
         
         # Add agentic retrieval status to system prompt
         agentic_status = "ENABLED" if self.search_agent.search_tool.enable_agentic_retrieval else "DISABLED"
         
-        # Build base prompt: inject skills metadata + agentic config
-        base_prompt = skill_injector.inject_skills_metadata(MASTER_AGENT_PROMPT)
-        enhanced_prompt = f"""{base_prompt}
+        enhanced_prompt = f"""{MASTER_AGENT_PROMPT}
 
 **CURRENT CONFIGURATION:**
 - Agentic Retrieval: {agentic_status}
@@ -651,16 +1353,13 @@ Sub-questions:"""
 
 Remember: When agentic retrieval is {agentic_status}, follow the corresponding workflow described above."""
         
-        agent = client.as_agent(
+        agent = create_maf_agent(
             name="MasterAgent",
             instructions=enhanced_prompt,
             tools=tools,
-            default_options={
-                "temperature": 0.1
-            }
+            temperature=0.1,
         )
-        
-        logger.info("MasterAgent created with AzureOpenAIChatClient")
+        logger.info("MasterAgent created with MAF OpenAIChatCompletionClient")
         return agent
     
     def get_new_thread(self):
@@ -671,7 +1370,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         Returns:
             New AgentThread instance
         """
-        thread = self.agent.get_new_thread()
+        thread = create_session(self.agent)
         logger.info(f"Created new conversation thread")
         return thread
     
@@ -691,21 +1390,28 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             Agent response with text and metadata
         """
         logger.info(f"MasterAgent.chat called with message: '{message}'")
-        
-        # Run the agent
-        result = await self.agent.run(message, thread=thread)
-        
+        turn = self._new_turn(message)
+        context_var = self._turn_context_var()
+        token = context_var.set(turn)
+
+        try:
+            result = await run_agent(self.agent, message, session=thread)
+        finally:
+            context_var.reset(token)
+
         logger.info(f"MasterAgent.chat completed, response length: {len(result.text)}")
-        
+
         return {
             "text": result.text,
-            "messages": [{"role": msg.role, "content": msg.text} for msg in result.messages]
+            "messages": [{"role": msg.role, "content": msg.text} for msg in result.messages],
         }
     
     async def chat_stream(
         self,
         message: str,
-        thread=None
+        thread=None,
+        stream_context: Any = None,
+        cancel_event: Optional[Event] = None,
     ):
         """
         Process a user message with streaming response.
@@ -719,14 +1425,20 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             Response chunks (text or agent events)
         """
         logger.info(f"MasterAgent.chat_stream called with message: '{message}'")
-        self._current_user_message = message
-        
-        # MAF's run_stream automatically maintains conversation history in the thread
+        turn = self._new_turn(
+            message,
+            stream_context=stream_context,
+            cancel_event=cancel_event,
+        )
+        context_var = self._turn_context_var()
+        token = context_var.set(turn)
+
         try:
-            async for update in self.agent.run_stream(message, thread=thread):
+            response_stream = stream_agent(self.agent, message, session=thread)
+            async for update in response_stream:
                 yield update
         finally:
-            self._current_user_message = ""
+            context_var.reset(token)
     
     def update_config(
         self,

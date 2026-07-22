@@ -158,6 +158,26 @@ class AppConfig:
     # Search configuration
     MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '20'))
     DEFAULT_TOP_K = int(os.getenv('DEFAULT_TOP_K', '20'))
+
+    # MasterAgent query engine limits. MAF applies these to one function-invocation loop.
+    QUERY_ENGINE_MAX_SEARCH_ATTEMPTS = max(1, int(os.getenv('QUERY_ENGINE_MAX_SEARCH_ATTEMPTS', '2')))
+    QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS = max(1, int(os.getenv('QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS', '3')))
+    QUERY_ENGINE_MAX_MODEL_ROUNDTRIPS = max(
+        1,
+        int(os.getenv('QUERY_ENGINE_MAX_MODEL_ROUNDTRIPS', '8')),
+    )
+    QUERY_ENGINE_MAX_FUNCTION_CALLS = max(
+        1,
+        int(os.getenv('QUERY_ENGINE_MAX_FUNCTION_CALLS', '12')),
+    )
+    SESSION_RESPONSE_CACHE_ENABLED = os.getenv(
+        'SESSION_RESPONSE_CACHE_ENABLED',
+        'true',
+    ).lower() == 'true'
+    SESSION_RESPONSE_CACHE_TTL_SECONDS = max(
+        0,
+        int(os.getenv('SESSION_RESPONSE_CACHE_TTL_SECONDS', '3600')),
+    )
     
     # Feature flags
     DEFAULT_ENABLE_SEMANTIC_RERANKER = os.getenv('DEFAULT_ENABLE_SEMANTIC_RERANKER', 'true').lower() == 'true'

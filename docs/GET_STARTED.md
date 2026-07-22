@@ -14,12 +14,12 @@
 
 | Agent | Purpose | Key Tools |
 |-------|---------|-----------|
-| **MasterAgent** | Orchestration, query routing, answer synthesis | `decompose_query`, `search_multiple_queries`, `search_knowledge`, `delegate_metadata`, `delegate_data_insight` |
+| **MasterAgent** | Orchestration and routing | `decompose_query`, `search_multiple_queries`, `search_knowledge`, `delegate_metadata`, `delegate_data_analysis` |
 | **SearchAgent** | Azure AI Search hybrid retrieval | `search_knowledge_base`, `parallel_search` |
 | **DataInsightAgent** | Databricks Unity Catalog SQL analytics | `get_relevant_tables`, `execute_sql`, `load_skill` |
-| **MetadataAgent** | Unity Catalog schema browsing | `list_schemas`, `list_tables`, `get_table_details`, `search_tables`, `load_skill` |
+| **MetadataAgent** | Unity Catalog schema browsing | `list_schemas`, `list_tables`, `get_table_details`, `search_tables`; native `metadata-mapping` Skill |
 
-All agents are powered by Azure OpenAI GPT-5.1 via the Microsoft Agent Framework (MAF) `AzureOpenAIChatClient`.
+All agents are powered by Azure OpenAI GPT-5.1 via Microsoft Agent Framework 1.11 and `OpenAIChatCompletionClient`.
 
 ### 🔌 Skill System
 
@@ -27,7 +27,7 @@ Plugin-based skills in `skills/`:
 - **`analytics-spec`** — data analytics query conventions
 - **`metadata-mapping`** — Unity Catalog metadata field mapping
 
-The `SkillRegistry` scans skills at startup; agents call `load_skill` to get full skill content at runtime. The `SkillInjector` embeds skill metadata XML into agent prompts automatically.
+MAF `SkillsProvider` discovers `SKILL.md` files, advertises only the Skills assigned to each agent, and registers native load/resource/script tools. Read-only loading is trusted; script execution remains approval-gated.
 
 ### 🖥️ Dual Frontend
 
@@ -45,16 +45,18 @@ src/
 ├── agents/
 │   ├── master_agent.py       # Orchestration (5 tools)
 │   ├── search_agent.py       # Azure AI Search (2 tools)
-│   ├── data_insight_agent.py # Databricks SQL (3 tools)
-│   └── metadata_agent.py     # Unity Catalog schema (5 tools)
+│   ├── data_insight_agent.py # Databricks SQL + analytics-spec provider
+│   ├── metadata_agent.py     # Unity Catalog + metadata-mapping provider
+│   └── maf_runtime.py        # MAF client/session/stream adapter
 ├── api/main.py               # FastAPI backend + SSE streaming + citation pipeline
 ├── config/settings.py        # All config classes (OpenAI, Search, Databricks, App)
-├── injector.py               # SkillInjector (XML prompt injection)
-├── registry.py               # SkillRegistry (scans skills/ dir)
+├── skills_provider.py        # Native MAF SkillsProvider factory/API adapter
 ├── tools/ai_search_tool.py   # Azure AI Search: hybrid, semantic, agentic modes
 └── prompts/system_prompts.py # Agent system prompts
 skills/
-├── analytics-spec/SKILL.md
+├── analytics-spec/
+│   ├── SKILL.md
+│   └── references/highest-spending-customer.sql
 └── metadata-mapping/SKILL.md
 frontend/src/
 ├── App.tsx                   # Chat UI + citation normalization
@@ -148,17 +150,21 @@ DATABRICKS_SCHEMAS=silver,gold
 ```
 User Question
        ↓
-MasterAgent (GPT-5.1)
+MasterAgent (GPT-5.1, main AgentSession + bounded agentic loop)
        ↓
+  Correct and enrich search terminology
+         ↓
   Simple?  → search_knowledge        → SearchAgent → Azure AI Search
   Complex? → decompose_query
               → search_multiple_queries (parallel) → SearchAgent
-  Data?    → delegate_data_insight   → DataInsightAgent → Databricks SQL
+       Data?    → delegate_data_analysis  → MetadataAgent → DataInsightAgent → Databricks SQL
   Schema?  → delegate_metadata       → MetadataAgent   → Unity Catalog
        ↓
 Collect search refs  →  push "refs" SSE event
        ↓
 Synthesize answer with context
+       ↓
+Stream answer tokens immediately; MAF exits when no further Agent/tool call is requested
        ↓
 Stream: thinking → text chunks → refs → done
        ↓

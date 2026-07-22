@@ -43,6 +43,11 @@ export const apiService = {
     await apiClient.delete(`/threads/${threadId}`);
   },
 
+  async stopThread(threadId: string): Promise<{ thread_id: string; stopped: boolean }> {
+    const response = await apiClient.post(`/threads/${threadId}/stop`);
+    return response.data;
+  },
+
   // Health check
   async healthCheck(): Promise<{ status: string; agent_initialized: boolean }> {
     const response = await apiClient.get('/health');

@@ -48,6 +48,9 @@ tmp/*
 data/*
 !data/.gitkeep
 
+# Local test scripts
+/test_script/
+
 # OS
 .DS_Store
 Thumbs.db
