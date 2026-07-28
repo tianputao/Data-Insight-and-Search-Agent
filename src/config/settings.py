@@ -21,6 +21,10 @@ class AzureOpenAIConfig:
     AUTH_MODE = os.getenv('AZURE_OPENAI_AUTH_MODE', 'auto').strip().lower()  # auto | key | aad
     API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview')
     GPT_DEPLOYMENT = os.getenv('AZURE_OPENAI_GPT_DEPLOYMENT', 'gpt-5.1')
+    SMALL_GPT_DEPLOYMENT = (
+        os.getenv('AZURE_OPENAI_GPT_SMALL_DEPLOYMENT', GPT_DEPLOYMENT).strip()
+        or GPT_DEPLOYMENT
+    )
 
     @classmethod
     def use_api_key(cls) -> bool:
@@ -135,11 +139,69 @@ class DatabricksConfig:
     
     # Query timeout in seconds
     QUERY_TIMEOUT = int(os.getenv('DATABRICKS_QUERY_TIMEOUT', '120'))
+
+    # Process-local, object-scoped UC tool cache. 0 means no expiry.
+    METADATA_CACHE_TTL_SECONDS = max(
+        0,
+        int(os.getenv('DATABRICKS_METADATA_CACHE_TTL_SECONDS', '900')),
+    )
+    METADATA_AGENT_TIMEOUT_SECONDS = max(
+        1,
+        int(os.getenv('METADATA_AGENT_TIMEOUT_SECONDS', '120')),
+    )
+    METADATA_AGENT_MAX_MODEL_ROUNDTRIPS = max(
+        1,
+        int(os.getenv('METADATA_AGENT_MAX_MODEL_ROUNDTRIPS', '5')),
+    )
+    METADATA_AGENT_MAX_FUNCTION_CALLS = max(
+        1,
+        int(os.getenv('METADATA_AGENT_MAX_FUNCTION_CALLS', '8')),
+    )
     
     @classmethod
     def is_configured(cls) -> bool:
         """Return True when the minimum required variables are present."""
         return bool(cls.HOST and cls.TOKEN and cls.HTTP_PATH)
+
+
+class OntologyConfig:
+    """Read-only Owlready2 ontology runtime configuration."""
+
+    _project_root = Path(__file__).parent.parent.parent
+    _directory_value = Path(
+        os.getenv('ONTOLOGY_DIR', str(_project_root / 'Ontology'))
+    ).expanduser()
+    DIRECTORY = (
+        _directory_value
+        if _directory_value.is_absolute()
+        else (_project_root / _directory_value).resolve()
+    )
+    FILE_GLOB = os.getenv('ONTOLOGY_FILE_GLOB', '**/*.owl')
+
+    ENABLE_REASONER = os.getenv('ONTOLOGY_ENABLE_REASONER', 'false').lower() == 'true'
+    REASONER = os.getenv('ONTOLOGY_REASONER', 'hermit').strip().lower()
+    ONLY_LOCAL = os.getenv('ONTOLOGY_ONLY_LOCAL', 'true').lower() == 'true'
+
+    MAX_RESULTS = max(1, int(os.getenv('ONTOLOGY_MAX_RESULTS', '25')))
+    MAX_DEPTH = max(1, int(os.getenv('ONTOLOGY_MAX_DEPTH', '5')))
+    MAX_PATHS = max(1, int(os.getenv('ONTOLOGY_MAX_PATHS', '10')))
+    MAX_NODES = max(10, int(os.getenv('ONTOLOGY_MAX_NODES', '250')))
+    FUZZY_THRESHOLD = min(
+        1.0,
+        max(0.0, float(os.getenv('ONTOLOGY_FUZZY_THRESHOLD', '0.62'))),
+    )
+    AGENT_TIMEOUT_SECONDS = max(
+        1,
+        int(os.getenv('ONTOLOGY_AGENT_TIMEOUT_SECONDS', '90')),
+    )
+    AGENT_MAX_MODEL_ROUNDTRIPS = max(
+        1,
+        int(os.getenv('ONTOLOGY_AGENT_MAX_MODEL_ROUNDTRIPS', '4')),
+    )
+    AGENT_MAX_FUNCTION_CALLS = max(
+        1,
+        int(os.getenv('ONTOLOGY_AGENT_MAX_FUNCTION_CALLS', '6')),
+    )
 
 
 class AppConfig:
@@ -182,6 +244,7 @@ class AppConfig:
     # Feature flags
     DEFAULT_ENABLE_SEMANTIC_RERANKER = os.getenv('DEFAULT_ENABLE_SEMANTIC_RERANKER', 'true').lower() == 'true'
     DEFAULT_ENABLE_AGENTIC_RETRIEVAL = os.getenv('DEFAULT_ENABLE_AGENTIC_RETRIEVAL', 'true').lower() == 'true'
+    DEFAULT_ENABLE_ONTOLOGY = os.getenv('DEFAULT_ENABLE_ONTOLOGY', 'true').lower() == 'true'
     
     # Ensure directories exist
     LOG_DIR.mkdir(exist_ok=True)

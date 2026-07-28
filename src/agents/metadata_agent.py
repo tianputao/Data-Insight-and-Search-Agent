@@ -19,13 +19,14 @@ load_skill         — load a named skill's full instruction body
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import json
-import threading
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
 
-from ..config import DatabricksConfig
+from ..config import AzureOpenAIConfig, DatabricksConfig
+from ..metadata_catalog import MetadataCatalogService
 from ..prompts import METADATA_AGENT_PROMPT
 from ..skills_provider import create_skills_provider
 from ..utils import get_logger
@@ -37,27 +38,6 @@ from .maf_runtime import (
 )
 
 logger = get_logger(__name__)
-
-
-# ─── Databricks SDK helpers ────────────────────────────────────────────────────
-
-def _get_workspace_client():
-    """Return a databricks-sdk WorkspaceClient, or raise RuntimeError if not available."""
-    if not DatabricksConfig.is_configured():
-        raise RuntimeError(
-            "Databricks connection is not configured. "
-            "Set DATABRICKS_HOST, DATABRICKS_TOKEN in .env."
-        )
-    try:
-        from databricks.sdk import WorkspaceClient
-        return WorkspaceClient(
-            host=DatabricksConfig.HOST,
-            token=DatabricksConfig.TOKEN,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "databricks-sdk is not installed. Run: pip install databricks-sdk"
-        ) from exc
 
 
 def _jdbc_query_metadata(sql: str) -> List[Dict[str, Any]]:
@@ -93,11 +73,47 @@ class MetadataAgent:
     Retrieves and enriches Unity Catalog metadata for the DataInsightAgent.
     """
 
-    def __init__(self, agent_id: str = "metadata_agent") -> None:
+    def __init__(
+        self,
+        agent_id: str = "metadata_agent",
+        catalog_service: Optional[MetadataCatalogService] = None,
+    ) -> None:
         self.agent_id = agent_id
+        self.catalog_service = catalog_service or MetadataCatalogService()
+        self._tool_result_sink: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+            f"{agent_id}_tool_result_sink",
+            default=None,
+        )
         tools = self._create_tools()
-        self.agent = self._create_agent(tools)
+        self.agent = self._create_agent(
+            tools,
+            name="MetadataAgent",
+            enable_skills=True,
+        )
+        self.verifier_agent = self._create_agent(
+            tools,
+            name="MetadataVerifierAgent",
+            enable_skills=False,
+        )
         logger.info(f"MetadataAgent '{agent_id}' initialised successfully.")
+
+    def _tool_json(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        """Return tool JSON and preserve the complete payload for downstream use."""
+        sink = self._tool_result_sink.get()
+        if sink is not None:
+            sink.append(
+                {
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "result": payload,
+                }
+            )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Tool definitions
@@ -105,39 +121,115 @@ class MetadataAgent:
 
     def _create_tools(self) -> List:
 
+        configured_catalog = DatabricksConfig.CATALOG
+        configured_schemas = tuple(DatabricksConfig.SCHEMAS)
+        schema_lookup = {
+            configured_schema.casefold(): configured_schema
+            for configured_schema in configured_schemas
+        }
+
+        def validate_catalog(catalog: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+            requested_catalog = (catalog or configured_catalog).strip()
+            if requested_catalog.casefold() != configured_catalog.casefold():
+                return None, {
+                    "status": "out_of_scope",
+                    "requested_catalog": requested_catalog,
+                    "configured_catalog": configured_catalog,
+                    "configured_schemas": list(configured_schemas),
+                    "error": "Catalog is not exposed by the runtime Databricks configuration.",
+                }
+            return configured_catalog, None
+
+        def validate_schema(schema: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+            requested_schema = (schema or DatabricksConfig.SCHEMA).strip()
+            configured_schema = schema_lookup.get(requested_schema.casefold())
+            if configured_schema is None:
+                return None, {
+                    "status": "out_of_scope",
+                    "requested_schema": requested_schema,
+                    "configured_catalog": configured_catalog,
+                    "configured_schemas": list(configured_schemas),
+                    "error": "Schema is not exposed by DATABRICKS_SCHEMAS.",
+                }
+            return configured_schema, None
+
         def list_schemas(
             catalog: Annotated[
                 str,
                 Field(description="Catalog name (default: from DATABRICKS_CATALOG env var)"),
             ] = "",
         ) -> str:
-            """List all schemas (databases) in the given catalog."""
-            catalog = catalog or DatabricksConfig.CATALOG
+            """List configured schemas that exist in the configured catalog."""
+            catalog, scope_error = validate_catalog(catalog)
+            if scope_error:
+                return self._tool_json(
+                    "list_schemas",
+                    {"catalog": scope_error["requested_catalog"]},
+                    scope_error,
+                )
+            assert catalog is not None
             logger.info(f"[Tool:list_schemas] catalog='{catalog}'")
 
-            if not DatabricksConfig.is_configured():
-                return "Databricks not configured. Set DATABRICKS_HOST/TOKEN/HTTP_PATH in .env."
-
             try:
-                client = _get_workspace_client()
-                schemas = list(client.schemas.list(catalog_name=catalog))
-                schema_names = [s.name for s in schemas]
-                result = {
-                    "catalog": catalog,
-                    "schemas": schema_names,
-                    "count": len(schema_names),
+                schema_names, cache_hit = self.catalog_service.list_schemas(
+                    catalog=catalog
+                )
+                available_lookup = {
+                    str(schema_name).casefold(): str(schema_name)
+                    for schema_name in schema_names
                 }
-                return json.dumps(result, ensure_ascii=False, indent=2)
-            except RuntimeError as exc:
-                return str(exc)
+                visible_schemas = [
+                    available_lookup[schema_name.casefold()]
+                    for schema_name in configured_schemas
+                    if schema_name.casefold() in available_lookup
+                ]
+                result = {
+                    "status": "ok",
+                    "catalog": catalog,
+                    "schemas": visible_schemas,
+                    "configured_schemas": list(configured_schemas),
+                    "count": len(visible_schemas),
+                    "source": "unity_catalog_cache",
+                    "cache_hit": cache_hit,
+                }
+                return self._tool_json(
+                    "list_schemas",
+                    {"catalog": catalog},
+                    result,
+                )
             except Exception as exc:
-                # Fallback using JDBC
-                logger.warning(f"[Tool:list_schemas] SDK failed, falling back to JDBC: {exc}")
+                logger.warning(
+                    "[Tool:list_schemas] SDK failed, falling back to JDBC: %s",
+                    exc,
+                )
                 try:
                     rows = _jdbc_query_metadata(f"SHOW SCHEMAS IN `{catalog}`")
-                    return json.dumps({"catalog": catalog, "schemas": rows}, ensure_ascii=False, indent=2)
-                except Exception as exc2:
-                    return f"Failed to list schemas: {exc2}"
+                    visible_rows = [
+                        row
+                        for row in rows
+                        if str(row[0] if isinstance(row, (list, tuple)) else row).casefold()
+                        in schema_lookup
+                    ]
+                    result = {
+                        "status": "ok",
+                        "catalog": catalog,
+                        "schemas": visible_rows,
+                        "configured_schemas": list(configured_schemas),
+                        "count": len(visible_rows),
+                        "source": "jdbc_fallback",
+                        "cache_hit": False,
+                    }
+                except Exception as fallback_exc:
+                    result = {
+                        "status": "error",
+                        "catalog": catalog,
+                        "error": str(fallback_exc),
+                    }
+                return self._tool_json(
+                    "list_schemas",
+                    {"catalog": catalog},
+                    result,
+                )
 
         def list_tables(
             schema: Annotated[
@@ -146,7 +238,7 @@ class MetadataAgent:
                     description=(
                         "Schema (database) name. "
                         "Leave empty to list tables from ALL configured schemas. "
-                        "Pass a specific schema name (e.g. 'silver' or 'gold') to list only that schema."
+                        "A supplied schema must be present in DATABRICKS_SCHEMAS."
                     )
                 ),
             ] = "",
@@ -158,44 +250,80 @@ class MetadataAgent:
             """List all tables in the given catalog.schema(s).
             When *schema* is empty, returns tables from every configured schema.
             """
-            catalog = catalog or DatabricksConfig.CATALOG
-            schemas_to_query = [schema] if schema else DatabricksConfig.SCHEMAS
+            catalog, catalog_error = validate_catalog(catalog)
+            if catalog_error:
+                return self._tool_json(
+                    "list_tables",
+                    {"catalog": catalog_error["requested_catalog"], "schema": schema},
+                    catalog_error,
+                )
+            if schema:
+                configured_schema, schema_error = validate_schema(schema)
+                if schema_error:
+                    return self._tool_json(
+                        "list_tables",
+                        {"catalog": catalog, "schema": schema},
+                        schema_error,
+                    )
+                schemas_to_query = [configured_schema]
+            else:
+                schemas_to_query = list(configured_schemas)
+            assert catalog is not None
             logger.info(f"[Tool:list_tables] {catalog}.{schemas_to_query}")
-
-            if not DatabricksConfig.is_configured():
-                return "Databricks not configured."
 
             all_results: Dict[str, Any] = {"catalog": catalog, "schemas": {}}
             total_count = 0
 
             for sch in schemas_to_query:
                 try:
-                    client = _get_workspace_client()
-                    tables = list(client.tables.list(catalog_name=catalog, schema_name=sch))
+                    tables, cache_hit = self.catalog_service.list_tables(
+                        catalog=catalog,
+                        schema=sch,
+                    )
                     table_info = [
                         {
-                            "name": t.name,
-                            "full_name": t.full_name,
-                            "table_type": str(t.table_type),
-                            "comment": t.comment or "",
+                            "name": table["name"],
+                            "full_name": table["full_name"],
+                            "table_type": table["table_type"],
+                            "comment": table["comment"],
                         }
-                        for t in tables
+                        for table in tables
                     ]
-                    all_results["schemas"][sch] = {"tables": table_info, "count": len(table_info)}
+                    all_results["schemas"][sch] = {
+                        "tables": table_info,
+                        "count": len(table_info),
+                        "cache_hit": cache_hit,
+                    }
                     total_count += len(table_info)
-                except RuntimeError as exc:
-                    all_results["schemas"][sch] = {"error": str(exc)}
                 except Exception as exc:
-                    logger.warning(f"[Tool:list_tables] SDK failed for {sch}, JDBC fallback: {exc}")
+                    logger.warning(
+                        "[Tool:list_tables] SDK failed for %s, JDBC fallback: %s",
+                        sch,
+                        exc,
+                    )
                     try:
-                        rows = _jdbc_query_metadata(f"SHOW TABLES IN `{catalog}`.`{sch}`")
-                        all_results["schemas"][sch] = {"tables": rows, "count": len(rows)}
+                        rows = _jdbc_query_metadata(
+                            f"SHOW TABLES IN `{catalog}`.`{sch}`"
+                        )
+                        all_results["schemas"][sch] = {
+                            "tables": rows,
+                            "count": len(rows),
+                            "source": "jdbc_fallback",
+                            "cache_hit": False,
+                        }
                         total_count += len(rows)
-                    except Exception as exc2:
-                        all_results["schemas"][sch] = {"error": str(exc2)}
+                    except Exception as fallback_exc:
+                        all_results["schemas"][sch] = {
+                            "error": str(fallback_exc)
+                        }
 
+            all_results["status"] = "ok" if total_count else "partial"
             all_results["total_count"] = total_count
-            return json.dumps(all_results, ensure_ascii=False, indent=2)
+            return self._tool_json(
+                "list_tables",
+                {"catalog": catalog, "schema": schema},
+                all_results,
+            )
 
         def get_table_details(
             table_name: Annotated[
@@ -209,68 +337,95 @@ class MetadataAgent:
             Return full column definitions, data types, nullable flags, comments, and UC tags
             for the specified table.  This is the primary tool for MetadataAgent.
             """
-            catalog = catalog or DatabricksConfig.CATALOG
-            schema = schema or DatabricksConfig.SCHEMA
+            requested_catalog = catalog
+            requested_schema = schema
 
             # Normalise table name to three-part
             parts = table_name.split(".")
             if len(parts) == 3:
-                catalog, schema, table_name = parts
+                requested_catalog, requested_schema, table_name = parts
             elif len(parts) == 2:
-                schema, table_name = parts
+                requested_schema, table_name = parts
             # else: bare name, use defaults above
+
+            catalog, catalog_error = validate_catalog(requested_catalog)
+            if catalog_error:
+                return self._tool_json(
+                    "get_table_details",
+                    {
+                        "table_name": table_name,
+                        "catalog": requested_catalog,
+                        "schema": requested_schema,
+                    },
+                    catalog_error,
+                )
+            schema, schema_error = validate_schema(requested_schema)
+            if schema_error:
+                return self._tool_json(
+                    "get_table_details",
+                    {
+                        "table_name": table_name,
+                        "catalog": catalog,
+                        "schema": requested_schema,
+                    },
+                    schema_error,
+                )
+            assert catalog is not None and schema is not None
 
             full_name = f"{catalog}.{schema}.{table_name}"
             logger.info(f"[Tool:get_table_details] full_name='{full_name}'")
 
-            if not DatabricksConfig.is_configured():
-                return "Databricks not configured."
-
             try:
-                client = _get_workspace_client()
-                table = client.tables.get(full_name=full_name)
-                columns = []
-                for col in (table.columns or []):
-                    col_info: Dict[str, Any] = {
-                        "name": col.name,
-                        "type": str(col.type_name),
-                        "nullable": getattr(col, "nullable", None),
-                        "comment": getattr(col, "comment", "") or "",
+                table, cache_hit = self.catalog_service.get_table(
+                    table_name,
+                    catalog=catalog,
+                    schema=schema,
+                )
+                if table is None:
+                    result = {
+                        "status": "no_match",
+                        "full_name": full_name,
+                        "error": "table not found",
                     }
-                    col_tags = getattr(col, "tags", None)
-                    if col_tags:
-                        try:
-                            col_info["tags"] = {k: v for k, v in col_tags.items()}
-                        except Exception:
-                            pass
-                    columns.append(col_info)
-
-                table_tags = getattr(table, "tags", None)
-                result = {
-                    "full_name": full_name,
-                    "table_type": str(table.table_type),
-                    "comment": getattr(table, "comment", "") or "",
-                    "owner": getattr(table, "owner", "") or "",
-                    "columns": columns,
-                    "column_count": len(columns),
-                }
-                if table_tags:
-                    try:
-                        result["table_tags"] = {k: v for k, v in table_tags.items()}
-                    except Exception:
-                        pass
-
-                return json.dumps(result, ensure_ascii=False, indent=2)
-
-            except RuntimeError as exc:
-                return str(exc)
+                else:
+                    result = {
+                        "status": "ok",
+                        **table,
+                        "column_count": len(table["columns"]),
+                        "source": "unity_catalog_cache",
+                        "cache_hit": cache_hit,
+                    }
             except Exception as exc:
-                logger.warning(f"[Tool:get_table_details] SDK failed, JDBC fallback: {exc}")
+                logger.warning(
+                    "[Tool:get_table_details] SDK failed, JDBC fallback: %s",
+                    exc,
+                )
                 try:
-                    rows = _jdbc_query_metadata(f"DESCRIBE TABLE EXTENDED `{catalog}`.`{schema}`.`{table_name}`")
-                    return json.dumps({"full_name": full_name, "describe": rows}, ensure_ascii=False, indent=2)
-                except Exception as exc2:
-                    return f"Failed to get table details: {exc2}"
+                    rows = _jdbc_query_metadata(
+                        f"DESCRIBE TABLE EXTENDED `{catalog}`.`{schema}`.`{table_name}`"
+                    )
+                    result = {
+                        "status": "ok",
+                        "full_name": full_name,
+                        "describe": rows,
+                        "source": "jdbc_fallback",
+                        "cache_hit": False,
+                    }
+                except Exception as fallback_exc:
+                    result = {
+                        "status": "error",
+                        "full_name": full_name,
+                        "error": str(fallback_exc),
+                    }
+            return self._tool_json(
+                "get_table_details",
+                {
+                    "table_name": table_name,
+                    "catalog": catalog,
+                    "schema": schema,
+                },
+                result,
+            )
 
         def search_tables(
             keyword: Annotated[
@@ -283,8 +438,8 @@ class MetadataAgent:
                 Field(
                     description=(
                         "Schema to search in. "
-                        "Leave empty to search across ALL configured schemas (e.g. silver, gold). "
-                        "Pass a specific schema name to narrow the search."
+                        "Leave empty to search across ALL configured schemas. "
+                        "A supplied schema must be present in DATABRICKS_SCHEMAS."
                     )
                 ),
             ] = "",
@@ -294,51 +449,69 @@ class MetadataAgent:
             When *schema* is empty, searches every configured schema.
             Useful when the user mentions a business concept but not the exact table name.
             """
-            catalog = catalog or DatabricksConfig.CATALOG
-            schemas_to_search = [schema] if schema else DatabricksConfig.SCHEMAS
-            keyword_lower = keyword.lower()
+            catalog, catalog_error = validate_catalog(catalog)
+            if catalog_error:
+                return self._tool_json(
+                    "search_tables",
+                    {
+                        "keyword": keyword,
+                        "catalog": catalog_error["requested_catalog"],
+                        "schema": schema,
+                    },
+                    catalog_error,
+                )
+            if schema:
+                configured_schema, schema_error = validate_schema(schema)
+                if schema_error:
+                    return self._tool_json(
+                        "search_tables",
+                        {"keyword": keyword, "catalog": catalog, "schema": schema},
+                        schema_error,
+                    )
+                schemas_to_search = [configured_schema]
+            else:
+                schemas_to_search = list(configured_schemas)
+            assert catalog is not None
             logger.info(f"[Tool:search_tables] keyword='{keyword}' in {catalog}.{schemas_to_search}")
-
-            if not DatabricksConfig.is_configured():
-                return "Databricks not configured."
 
             all_matches: list = []
 
             for sch in schemas_to_search:
                 try:
-                    client = _get_workspace_client()
-                    tables = list(client.tables.list(catalog_name=catalog, schema_name=sch))
+                    tables, cache_hit = self.catalog_service.search_tables(
+                        keyword,
+                        catalog=catalog,
+                        schema=sch,
+                    )
                     matches = [
                         {
-                            "name": t.name,
-                            "full_name": t.full_name,
+                            "name": table["name"],
+                            "full_name": table["full_name"],
                             "schema": sch,
-                            "comment": t.comment or "",
-                            "table_type": str(t.table_type),
+                            "comment": table["comment"],
+                            "table_type": table["table_type"],
+                            "cache_hit": cache_hit,
                         }
-                        for t in tables
-                        if keyword_lower in (t.name or "").lower()
-                        or keyword_lower in (t.comment or "").lower()
+                        for table in tables
                     ]
                     all_matches.extend(matches)
-                except RuntimeError as exc:
-                    logger.warning(f"[Tool:search_tables] RuntimeError for schema '{sch}': {exc}")
                 except Exception as exc:
-                    logger.warning(f"[Tool:search_tables] SDK failed for {sch}, JDBC fallback: {exc}")
-                    try:
-                        rows = _jdbc_query_metadata(
-                            f"SHOW TABLES IN `{catalog}`.`{sch}` LIKE '*{keyword}*'"
-                        )
-                        for row in rows:
-                            row["schema"] = sch
-                        all_matches.extend(rows)
-                    except Exception as exc2:
-                        logger.warning(f"[Tool:search_tables] JDBC fallback also failed for {sch}: {exc2}")
+                    logger.warning(f"[Tool:search_tables] Cached search failed for {sch}: {exc}")
 
-            return json.dumps(
-                {"keyword": keyword, "schemas_searched": schemas_to_search, "matches": all_matches, "count": len(all_matches)},
-                ensure_ascii=False,
-                indent=2,
+            return self._tool_json(
+                "search_tables",
+                {
+                    "keyword": keyword,
+                    "catalog": catalog,
+                    "schema": schema,
+                },
+                {
+                    "status": "ok" if all_matches else "no_match",
+                    "keyword": keyword,
+                    "schemas_searched": schemas_to_search,
+                    "matches": all_matches,
+                    "count": len(all_matches),
+                },
             )
 
         return [list_schemas, list_tables, get_table_details, search_tables]
@@ -347,26 +520,44 @@ class MetadataAgent:
     # Agent creation
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _create_agent(self, tools: List):
+    def _create_agent(
+        self,
+        tools: List,
+        *,
+        name: str,
+        enable_skills: bool,
+    ):
         """Initialise the MAF MetadataAgent."""
         enriched_prompt = METADATA_AGENT_PROMPT
         db_context = (
             f"\n\n## Databricks Context\n"
             f"- Default catalog: `{DatabricksConfig.CATALOG}`\n"
             f"- Default schema: `{DatabricksConfig.SCHEMA}`\n"
+            f"- Exposed schemas (authoritative allowlist): "
+            f"{', '.join(f'`{schema}`' for schema in DatabricksConfig.SCHEMAS)}\n"
+            f"- Never request or describe a catalog/schema outside this allowlist.\n"
             f"- Configured: {DatabricksConfig.is_configured()}\n"
         )
         enriched_prompt += db_context
 
-        skills_provider = create_skills_provider("MetadataAgent")
+        skills_provider = (
+            create_skills_provider("MetadataAgent") if enable_skills else None
+        )
         agent = create_maf_agent(
-            name="MetadataAgent",
+            name=name,
             instructions=enriched_prompt,
             tools=tools,
             temperature=0.0,
             context_providers=[skills_provider] if skills_provider else None,
+            model=AzureOpenAIConfig.SMALL_GPT_DEPLOYMENT,
+            max_iterations=DatabricksConfig.METADATA_AGENT_MAX_MODEL_ROUNDTRIPS,
+            max_function_calls=DatabricksConfig.METADATA_AGENT_MAX_FUNCTION_CALLS,
         )
-        logger.info("MetadataAgent created with MAF OpenAIChatCompletionClient.")
+        logger.info(
+            "%s created with MAF OpenAIChatCompletionClient (skills=%s).",
+            name,
+            enable_skills,
+        )
         return agent
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -377,19 +568,176 @@ class MetadataAgent:
         """Create a new MAF conversation thread."""
         return create_session(self.agent)
 
-    async def query(self, question: str, thread=None) -> str:
+    def rewrite_sql_identifiers(self, sql: str) -> tuple[str, list[dict[str, str]]]:
+        """Correct identifiers using only details selected earlier in this process."""
+        return self.catalog_service.rewrite_sql_identifiers(sql)
+
+    @staticmethod
+    def build_collected_context(
+        agent_summary: str,
+        tool_results: list[dict[str, Any]],
+    ) -> str:
+        """Preserve relevant UC tool evidence alongside the agent summary."""
+        return json.dumps(
+            {
+                "status": "ok" if tool_results else "no_tool_results",
+                "source": "metadata_agent",
+                "agent_summary": agent_summary,
+                "all_tool_results": tool_results,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def build_ontology_verification_context(ontology_context: str) -> str:
+        """Project canonical ontology evidence into a bounded UC verification request."""
+        if not ontology_context.strip():
+            return ""
+        try:
+            collected = json.loads(ontology_context)
+        except (TypeError, json.JSONDecodeError):
+            return json.dumps(
+                {
+                    "status": "unstructured",
+                    "unresolved": ["Ontology context could not be parsed for UC verification"],
+                },
+                ensure_ascii=False,
+            )
+
+        primary = collected.get("primary_business_context")
+        if not isinstance(primary, dict):
+            return json.dumps(
+                {
+                    "status": "missing_primary_context",
+                    "unresolved": ["Ontology context has no primary business context"],
+                },
+                ensure_ascii=False,
+            )
+        data = primary.get("data") if isinstance(primary.get("data"), dict) else primary
+        schema_mapping = (
+            data.get("schema_mapping")
+            if isinstance(data.get("schema_mapping"), dict)
+            else {}
+        )
+        projection = {
+            "status": primary.get("status", collected.get("status", "unknown")),
+            "root_entity": data.get("root_entity"),
+            "root_entity_detail": data.get("root_entity_detail"),
+            "filters": data.get("filters", [])[:10],
+            "semantic_properties": data.get("semantic_properties", [])[:20],
+            "semantic_relationships": data.get(
+                "semantic_relationships", []
+            )[:12],
+            "join_paths": data.get("join_paths", [])[:8],
+            "candidate_tables": schema_mapping.get("candidate_tables", [])[:12],
+            "candidate_columns": schema_mapping.get("candidate_columns", [])[:30],
+            "entity_candidates": data.get("entity_candidates", [])[:8],
+            "requires_metadata_resolution": data.get(
+                "requires_metadata_resolution", True
+            ),
+            "warnings": primary.get("warnings", [])[:12],
+            "unresolved": primary.get("unresolved", [])[:12],
+        }
+        return json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _with_ontology_verification_context(
+        cls,
+        question: str,
+        ontology_context: str,
+    ) -> str:
+        verification_context = cls.build_ontology_verification_context(
+            ontology_context
+        )
+        if not verification_context:
+            return question
+        return (
+            "<ontology_verification_context>\n"
+            f"{verification_context}\n"
+            "</ontology_verification_context>\n\n"
+            f"{question}"
+        )
+
+    @classmethod
+    def _prepare_contextual_question(
+        cls,
+        question: str,
+        *,
+        ontology_context: str,
+        require_metadata_mapping: bool,
+    ) -> str:
+        contextual_question = cls._with_ontology_verification_context(
+            question,
+            ontology_context,
+        )
+        if require_metadata_mapping and not ontology_context:
+            return (
+                "<metadata_discovery_mode>\n"
+                "required_skill=metadata-mapping\n"
+                "Load this Skill progressively before the first Unity Catalog tool call.\n"
+                "</metadata_discovery_mode>\n\n"
+                f"{contextual_question}"
+            )
+        return contextual_question
+
+    async def query(
+        self,
+        question: str,
+        thread=None,
+        ontology_context: str = "",
+        require_metadata_mapping: bool = False,
+        context_sink: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         """
         Retrieve schema metadata relevant to *question*.
         Returns a YAML/markdown schema context block.
         """
         logger.info(f"MetadataAgent.query: '{question[:80]}'")
-        result = await run_agent(self.agent, question, session=thread)
-        logger.info(f"MetadataAgent.query completed, len={len(result.text)}")
-        logger.debug(f"MetadataAgent.query result preview:\n{result.text[:600]}")
-        return result.text
+        sink = context_sink if context_sink is not None else []
+        token = self._tool_result_sink.set(sink)
+        try:
+            selected_agent = self.verifier_agent if ontology_context else self.agent
+            contextual_question = self._prepare_contextual_question(
+                question,
+                ontology_context=ontology_context,
+                require_metadata_mapping=require_metadata_mapping,
+            )
+            result = await run_agent(
+                selected_agent,
+                contextual_question,
+                session=thread if selected_agent is self.agent else None,
+            )
+            logger.info(f"MetadataAgent.query completed, len={len(result.text)}")
+            logger.debug(f"MetadataAgent.query result preview:\n{result.text[:600]}")
+            return self.build_collected_context(result.text, sink)
+        finally:
+            self._tool_result_sink.reset(token)
 
-    async def query_stream(self, question: str, thread=None):
+    async def query_stream(
+        self,
+        question: str,
+        thread=None,
+        ontology_context: str = "",
+        require_metadata_mapping: bool = False,
+        context_sink: Optional[list[dict[str, Any]]] = None,
+    ):
         """Streaming version of :meth:`query`."""
         logger.info(f"MetadataAgent.query_stream: '{question[:80]}'")
-        async for update in stream_agent(self.agent, question, session=thread):
-            yield update
+        sink = context_sink if context_sink is not None else []
+        token = self._tool_result_sink.set(sink)
+        try:
+            selected_agent = self.verifier_agent if ontology_context else self.agent
+            contextual_question = self._prepare_contextual_question(
+                question,
+                ontology_context=ontology_context,
+                require_metadata_mapping=require_metadata_mapping,
+            )
+            async for update in stream_agent(
+                selected_agent,
+                contextual_question,
+                session=thread if selected_agent is self.agent else None,
+            ):
+                yield update
+        finally:
+            self._tool_result_sink.reset(token)

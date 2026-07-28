@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ChatRequest, ChatResponse, SkillInfo, SessionInfo } from '../types';
+import type { ChatRequest, ChatResponse, RuntimeConfig, SkillInfo, SessionInfo } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -51,6 +51,11 @@ export const apiService = {
   // Health check
   async healthCheck(): Promise<{ status: string; agent_initialized: boolean }> {
     const response = await apiClient.get('/health');
+    return response.data;
+  },
+
+  async getRuntimeConfig(): Promise<RuntimeConfig> {
+    const response = await apiClient.get<RuntimeConfig>('/config');
     return response.data;
   },
 };

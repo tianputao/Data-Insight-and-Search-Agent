@@ -26,10 +26,14 @@ python-dotenv>=1.0.0
 # ── Azure Databricks ─────────────────────────────────────────────────────────
 databricks-sql-connector>=3.0.0    # JDBC-style SQL execution against Databricks warehouse
 databricks-sdk>=0.20.0             # Unity Catalog REST API (table/schema metadata)
+sqlglot>=30.13.0,<31.0.0           # Parse Databricks SQL for catalog/schema scope enforcement
 
 # ── Data Processing ───────────────────────────────────────────────────────────
 numpy>=1.24.0
 pandas>=2.0.0
+
+# ── Ontology Runtime ──────────────────────────────────────────────────────────
+owlready2>=0.48,<1.0
 
 # ── Async Support ─────────────────────────────────────────────────────────────
 aiohttp>=3.9.0

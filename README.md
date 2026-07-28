@@ -5,7 +5,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 ## 🌟 Features
 
 ### Core Capabilities
-- **Multi-Agent Architecture**: MasterAgent orchestrates three specialized agents — SearchAgent, DataInsightAgent, and MetadataAgent — each with domain-specific tools
+- **Multi-Agent Architecture**: MasterAgent orchestrates four specialized agents — SearchAgent, OntologyAgent, MetadataAgent, and DataInsightAgent — each with domain-specific tools
 - **MasterAgent Agentic Loop**: One bounded MAF function loop repeats model → Agent/tool → observation until the model emits a final answer without another tool call
 - **Skill System**: Native MAF `SkillsProvider` advertises agent-scoped skills and loads full instructions or indexed resources on demand
 - **Intelligent Query Processing**: Query correction and enrichment, automatic decomposition (`decompose_query`), multi-query parallel search (`search_multiple_queries`), aggregation, and selective delegation by question type
@@ -14,6 +14,8 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Agentic Retrieval**: Optional Azure AI Search agentic retrieval mode for automated query understanding
 - **Data Insight**: DataInsightAgent executes natural-language-to-SQL queries against Azure Databricks Unity Catalog
 - **Metadata Browsing**: MetadataAgent lists schemas, tables, and column details from Unity Catalog
+- **Skill- and Ontology-Guided Analytics**: Governed template Skills can route directly to DataInsightAgent; ordinary requests use role-neutral OWL evidence, UC physical verification, and a dynamically loaded planning Skill so the primary model derives SQL at runtime
+- **Session-Scoped Ontology Mode**: Each chat session independently enables or disables ontology enrichment; failures are shown in the thinking panel and fall back to the standard metadata-driven workflow
 - **Multi-turn Conversations**: Context-aware dialogue with MAF in-memory thread store; each browser session gets an isolated thread
 - **Concurrent Sessions**: Each thread has independent messages, loading state, MAF history, cancellation, and can run alongside other threads
 - **Stop & Session Cache**: Stop cancels only the active thread; exact repeated questions can reuse a completed answer from the same session without external calls
@@ -21,7 +23,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Citation Pipeline**: Search references are collected during tool calls, merged across sources, and rendered as inline footnotes with optional Blob Storage URLs
 
 ### Technology Stack
-- **LLM**: Azure OpenAI GPT-5.1
+- **LLM routing**: Primary Azure OpenAI deployment for Master/DataInsight; `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT` for Ontology/Metadata
 - **Embedding**: text-embedding-3-large (3072 dimensions)
 - **Vector Database**: Azure AI Search
 - **Agent Framework**: Microsoft Agent Framework 1.11 — `OpenAIChatCompletionClient`
@@ -29,6 +31,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Backend API**: FastAPI with Server-Sent Events (port 8000)
 - **Secondary Frontend**: Streamlit standalone app (`app.py`, port 8501) — RAG only
 - **Data Analytics**: Azure Databricks Unity Catalog (SQL Warehouse via JDBC)
+- **Ontology Runtime**: Owlready2 with read-only recursive OWL loading; optional HermiT reasoning is disabled by default because the current OWL uses unsupported `xsd:date`
 - **Monitoring**: Azure AI Foundry
 - **Agent Skills**: Extend the agent’s capabilities using agent skills, enabling the agent to analyze and search data based on real-world business rules.
 - **Sub Agents**: Adopt a multi-agent architecture, using domain-specific agents to improve efficiency and isolate context.
@@ -57,16 +60,17 @@ flowchart TD
         FS --> SP
     end
 
-    subgraph AgentLayer["Agent Layer — Microsoft Agent Framework · Azure OpenAI GPT-5.1"]
+    subgraph AgentLayer["Agent Layer — Microsoft Agent Framework · Azure OpenAI"]
         MA(["🧠 MasterAgent\nBounded agentic loop"])
         SA(["🔍 SearchAgent"])
+        OA(["OntologyAgent"])
         DIA(["📊 DataInsightAgent"])
         META(["🗂️ MetadataAgent"])
-        MA --> SA & DIA & META
+        MA --> SA & OA & DIA & META
     end
 
     subgraph AzureServices["Azure Services"]
-        AOAI["☁️ Azure OpenAI\nGPT-5.1 + text-embedding-3-large"]
+        AOAI["☁️ Azure OpenAI\nprimary + small GPT deployments\ntext-embedding-3-large"]
         AIS["🔎 Azure AI Search\nHybrid · Semantic · Agentic"]
         Blob["🗄️ Azure Blob Storage\nDocument & Image SAS URLs"]
         AIF["📈 Azure AI Foundry\nMonitoring & Evaluation"]
@@ -86,6 +90,7 @@ flowchart TD
     SP -.->|agent-scoped skills| DIA & META
 
     SA --> AIS & AOAI
+    OA --> OWL[("Ontology/*.owl")]
     AIS --> Blob
     DIA --> SQLW
     META --> SQLW
@@ -104,12 +109,15 @@ Comprehensive_AI_Agent/
 │   │   │                        #   delegate_metadata, delegate_data_analysis
 │   │   ├── search_agent.py      # Azure AI Search; tools: search_knowledge_base,
 │   │   │                        #   parallel_search
-│   │   ├── data_insight_agent.py# Databricks SQL; tools: get_relevant_tables,
-│   │   │                        #   execute_sql; native Skill: analytics-spec
+│   │   ├── data_insight_agent.py# Databricks SQL; execute_sql + bounded
+│   │   │                        #   context recovery; governed + dynamic planning Skills
 │   │   ├── metadata_agent.py    # Unity Catalog schema; tools: list_schemas,
 │   │                            #   list_tables, get_table_details, search_tables;
 │   │                            #   native Skill: metadata-mapping
+│   │   ├── ontology_agent.py    # Owlready2 semantic entity/property/path tools
 │   │   └── maf_runtime.py       # MAF 1.11 client/session/stream adapter
+│   ├── ontology/
+│   │   └── service.py            # Read-only OWL loading, indexing, and graph queries
 │   ├── query_engine.py          # Request-scoped MasterAgent observations,
 │   │                            #   search attempts, and streaming context
 │   ├── api/
@@ -129,6 +137,8 @@ Comprehensive_AI_Agent/
 │   │   ├── SKILL.md             # Intent routing + resource index
 │   │   └── references/
 │   │       └── highest-spending-customer.sql
+│   ├── ontology-sql-planning/   # Skill: dynamic OWL + UC SQL planning method
+│   │   └── SKILL.md
 │   └── metadata-mapping/        # Skill: Unity Catalog metadata conventions
 │       └── SKILL.md
 ├── frontend/                    # React + TypeScript (Vite)
@@ -154,8 +164,9 @@ Comprehensive_AI_Agent/
 
 - Python 3.10 or higher
 - Node.js 18+ (for React frontend)
+- Java 11+ (for HermiT startup reasoning; explicit OWL queries remain available if reasoning is unsupported by an ontology)
 - Azure subscription with:
-  - Azure OpenAI service (GPT-5.1 + text-embedding-3-large deployments)
+    - Azure OpenAI service with primary GPT, small GPT, and text-embedding-3-large deployments
   - Azure AI Search service (semantic search + vector search enabled)
   - Azure Blob Storage (for document and image URL resolution)
   - Azure AI Foundry project (optional, for monitoring)
@@ -219,6 +230,7 @@ Access the React UI at `http://localhost:3000`.
 2. **New Conversation**: Click "New Chat" to start a fresh session (new MAF thread)
 3. **Streaming Responses**: Answers stream token-by-token; "thinking" steps appear above the answer
 4. **Citations**: Inline footnotes `[1]`, `[2]` link to source documents when a URL is available; plain-text titles are shown for internal documents without a public URL
+5. **Ontology mode**: Use the sidebar switch to enable ontology enrichment for the current session only
 
 ### Question Types
 
@@ -237,6 +249,11 @@ Controlled via `.env` defaults or at runtime via the frontend:
 |------|---------|--------|
 | `DEFAULT_ENABLE_SEMANTIC_RERANKER` | `true` | Azure AI Search semantic reranking |
 | `DEFAULT_ENABLE_AGENTIC_RETRIEVAL` | `true` | Azure-managed agentic retrieval mode |
+| `DEFAULT_ENABLE_ONTOLOGY` | `true` | Initial Ontology switch value for each new chat session |
+
+With Ontology enabled, analytical questions start in OntologyAgent using the small model. A confirmed governed template match skips Owlready2 and MetadataAgent, then DataInsightAgent loads the named Skill and indexed resource. Non-template questions run `role-neutral OntologyAgent → skill-free Metadata verifier → DataInsightAgent`, where the primary model loads `ontology-sql-planning` and dynamically chooses analytical roles, grain, comparisons, and SQL.
+
+With Ontology disabled or unavailable, analytical questions run `MetadataAgent (progressively loads metadata-mapping) → DataInsightAgent`. Every non-governed DataInsight request loads `ontology-sql-planning`; without Ontology it applies the same dynamic method using the original question and verified Metadata only, without inventing semantic evidence. MasterAgent and DataInsightAgent use the primary GPT deployment; Ontology and both Metadata modes use `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT`.
 
 ## ⚙️ Configuration Reference
 
@@ -246,6 +263,7 @@ All configuration classes are in `src/config/settings.py`:
 - `AzureSearchConfig` — endpoint, API key, index name, all 30+ field name mappings, blob/image storage URLs and SAS tokens, vector profile, semantic config name
 - `AzureAIFoundryConfig` — connection string for monitoring
 - `DatabricksConfig` — workspace host, PAT token, SQL warehouse HTTP path, Unity Catalog name, schema list, max rows, query timeout
+- `OntologyConfig` — OWL directory/glob, local-only loading, reasoner, query limits, fuzzy threshold, and agent timeout
 - `AppConfig` — log level, search result limits, feature flag defaults, directory paths
 
 ## 📊 Evaluation

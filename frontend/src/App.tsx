@@ -16,7 +16,10 @@ const EXAMPLE_QUERIES = [
   "什么是management body, 它在乘用车法规里做什么用的，目前发行了几个版本",
   "哪个客户在2023年的消费是最高的",
   "按月看2023年的销售额趋势",
-  "按产品类别看2023的销量"
+  "哪个地区的成交量是最高的，在这个地区那个产品销量最高，并且结合数据分析原因",
+  "按企业正式定义分析 2023 年高价值订单的月度趋势、订单占比和销售额贡献率。",
+  "按地区同时比较订单数、销量、销售额和平均客单价，并解释最高地区领先第二名的主要结构因素。",
+  "2024年高价值在线订单主要来自哪类客户、发往哪些地区、集中在哪些顶层产品大类？并区分观察事实、解释假设和因果结论。"
 ];
 
 interface MessageWithThinking extends ChatMessage {
@@ -267,6 +270,8 @@ function App() {
   const [sessionCounter, setSessionCounter] = useState(1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [sessionMessages, setSessionMessages] = useState<Map<string, MessageWithThinking[]>>(new Map());
+  const [defaultEnableOntology, setDefaultEnableOntology] = useState(true);
+  const [sessionOntologyModes, setSessionOntologyModes] = useState<Map<string, boolean>>(new Map());
   const [loadingSessionIds, setLoadingSessionIds] = useState<Set<string>>(new Set());
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
@@ -274,6 +279,7 @@ function App() {
 
   const messages = sessionMessages.get(currentSessionId) ?? EMPTY_MESSAGES;
   const isLoading = loadingSessionIds.has(currentSessionId);
+  const ontologyEnabled = sessionOntologyModes.get(currentSessionId) ?? defaultEnableOntology;
 
   const updateSessionMessages = (
     sessionId: string,
@@ -290,7 +296,7 @@ function App() {
     // Create the initial session on mount
     if (sessions.length === 0 && !initialSessionRequestedRef.current) {
       initialSessionRequestedRef.current = true;
-      createInitialSession();
+      initializeApplication();
     }
   }, []);
 
@@ -315,7 +321,19 @@ function App() {
     return () => container.removeEventListener('scroll', handleScroll);
   }, []);
 
-  const createInitialSession = async () => {
+  const initializeApplication = async () => {
+    let ontologyDefault = true;
+    try {
+      const runtimeConfig = await apiService.getRuntimeConfig();
+      ontologyDefault = runtimeConfig.default_enable_ontology;
+      setDefaultEnableOntology(ontologyDefault);
+    } catch (error) {
+      console.error('Failed to load runtime config; using ontology default:', error);
+    }
+    await createInitialSession(ontologyDefault);
+  };
+
+  const createInitialSession = async (ontologyDefault: boolean) => {
     try {
       const result = await apiService.createThread();
       const newSession: SessionInfo = {
@@ -328,6 +346,7 @@ function App() {
       setSessions([newSession]);
       setSessionCounter(2);
       setSessionMessages(new Map([[result.thread_id, []]]));
+      setSessionOntologyModes(new Map([[result.thread_id, ontologyDefault]]));
     } catch (error) {
       initialSessionRequestedRef.current = false;
       console.error('Failed to create initial session:', error);
@@ -347,6 +366,7 @@ function App() {
       setSessions(prev => [...prev, newSession]);
       setSessionCounter(prev => prev + 1);
       setSessionMessages(prev => new Map(prev).set(result.thread_id, []));
+      setSessionOntologyModes(prev => new Map(prev).set(result.thread_id, defaultEnableOntology));
     } catch (error) {
       console.error('Failed to create session:', error);
     }
@@ -378,6 +398,11 @@ function App() {
         newMap.delete(sessionId);
         return newMap;
       });
+      setSessionOntologyModes(prev => {
+        const next = new Map(prev);
+        next.delete(sessionId);
+        return next;
+      });
 
       setSessions(prev => prev.filter(s => s.id !== sessionId));
       setLoadingSessionIds(previous => {
@@ -403,6 +428,7 @@ function App() {
 
     const sessionId = currentSessionId;
     if (!sessionId) return;
+    const requestOntologyMode = sessionOntologyModes.get(sessionId) ?? defaultEnableOntology;
 
     const userMessage: MessageWithThinking = {
       role: 'user',
@@ -440,7 +466,8 @@ function App() {
         },
         body: JSON.stringify({
           message: currentInput,
-          thread_id: sessionId
+          thread_id: sessionId,
+          enable_ontology: requestOntologyMode
         }),
         signal: abortController.signal,
       });
@@ -685,6 +712,11 @@ function App() {
     setInputValue(query);
   };
 
+  const setCurrentSessionOntology = (enabled: boolean) => {
+    if (!currentSessionId) return;
+    setSessionOntologyModes(previous => new Map(previous).set(currentSessionId, enabled));
+  };
+
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -715,6 +747,27 @@ function App() {
               <span className="nav-text">New Session</span>
             </button>
           </div>
+
+          {!sidebarCollapsed && (
+            <div className="nav-section">
+              <div className="nav-section-title">Session Settings</div>
+              <label className="session-toggle-row">
+                <span className="session-toggle-label">Ontology</span>
+                <input
+                  className="session-toggle-input"
+                  type="checkbox"
+                  role="switch"
+                  checked={ontologyEnabled}
+                  disabled={!currentSessionId}
+                  onChange={(event) => setCurrentSessionOntology(event.target.checked)}
+                  aria-label="Enable ontology for this session"
+                />
+                <span className="session-toggle-track" aria-hidden="true">
+                  <span className="session-toggle-thumb" />
+                </span>
+              </label>
+            </div>
+          )}
 
           {/* Current Chat Section */}
           <div className="nav-section">

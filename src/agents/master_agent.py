@@ -7,20 +7,27 @@ from contextvars import ContextVar, copy_context
 from threading import Event
 from typing import List, Dict, Any, Optional, Annotated
 import json
+import re
 import time
 from pydantic import Field
 
 from .search_agent import SearchAgent
 from .data_insight_agent import DataInsightAgent
 from .metadata_agent import MetadataAgent
-from ..config import AppConfig
+from .ontology_agent import OntologyAgent
+from ..config import AppConfig, DatabricksConfig, OntologyConfig
 from ..prompts import MASTER_AGENT_PROMPT
 from ..query_engine import QueryEngineContext
+from ..skills_provider import (
+    configured_skill_names,
+    configured_skill_resource_exists,
+)
 from ..utils import get_logger
 from ..utils.activity import (
     agent_activity,
     narration_activity,
     new_activity_id,
+    ontology_tool_result_fields,
     pipeline_activity,
     stage_activity,
     tool_activity,
@@ -48,6 +55,7 @@ class MasterAgent:
         search_agent: SearchAgent,
         data_insight_agent: Optional[DataInsightAgent] = None,
         metadata_agent: Optional[MetadataAgent] = None,
+        ontology_agent: Optional[OntologyAgent] = None,
         agent_id: str = "master_agent"
     ):
         """
@@ -57,11 +65,13 @@ class MasterAgent:
             search_agent: Configured search agent (required).
             data_insight_agent: Optional DataInsightAgent for analytical queries.
             metadata_agent: Optional MetadataAgent for UC schema queries.
+            ontology_agent: Optional OntologyAgent for OWL business context.
             agent_id: Unique identifier.
         """
         self.search_agent = search_agent
         self.data_insight_agent = data_insight_agent
         self.metadata_agent = metadata_agent
+        self.ontology_agent = ontology_agent
         self.agent_id = agent_id
         self._active_turn_context: ContextVar[Optional[QueryEngineContext]] = ContextVar(
             f"{agent_id}_active_turn_context",
@@ -94,10 +104,16 @@ class MasterAgent:
         *,
         stream_context: Any = None,
         cancel_event: Optional[Event] = None,
+        enable_ontology: Optional[bool] = None,
     ) -> QueryEngineContext:
         return QueryEngineContext(
             original_question=message,
             max_search_attempts=AppConfig.QUERY_ENGINE_MAX_SEARCH_ATTEMPTS,
+            enable_ontology=(
+                AppConfig.DEFAULT_ENABLE_ONTOLOGY
+                if enable_ontology is None
+                else enable_ontology
+            ),
             stream_context=stream_context,
             cancel_event=cancel_event,
         )
@@ -261,6 +277,7 @@ class MasterAgent:
             arguments: str,
             agent: str,
             parent_id: str,
+            result: Any = None,
             error: bool = False,
         ) -> None:
             if call_id:
@@ -276,6 +293,8 @@ class MasterAgent:
                     parent_id=parent_id,
                 )
                 activity["state"] = "error" if error else "completed"
+                if not error:
+                    activity.update(ontology_tool_result_fields(name, result))
                 push_stream_event(
                     "activity",
                     activity,
@@ -287,6 +306,7 @@ class MasterAgent:
             agent: str,
             parent_id: str,
             stream_final_text: bool,
+            tool_call_sink: Optional[List[Dict[str, Any]]] = None,
         ) -> str:
             """Forward nested model narration and tool lifecycle without exposing private reasoning."""
             active_text: List[str] = []
@@ -304,6 +324,7 @@ class MasterAgent:
                 return any(
                     marker in result_text
                     for marker in (
+                        "blocked:",
                         "query execution failed",
                         "configuration error",
                         "only read-only",
@@ -400,6 +421,21 @@ class MasterAgent:
                                 name, arguments, tool_started_at = call_info
                                 result_payload = getattr(content, "result", None)
                                 exception = getattr(content, "exception", None)
+                                try:
+                                    parsed_arguments = (
+                                        json.loads(arguments) if arguments else {}
+                                    )
+                                except json.JSONDecodeError:
+                                    parsed_arguments = {}
+                                if tool_call_sink is not None:
+                                    tool_call_sink.append(
+                                        {
+                                            "name": name,
+                                            "arguments": parsed_arguments,
+                                            "result": result_payload,
+                                            "error": str(exception) if exception else "",
+                                        }
+                                    )
                                 failed = tool_result_failed(
                                     name,
                                     result_payload,
@@ -411,6 +447,7 @@ class MasterAgent:
                                     arguments,
                                     agent,
                                     parent_id,
+                                    result=result_payload,
                                     error=failed,
                                 )
                                 self._record_tool_outcome(
@@ -957,20 +994,13 @@ Sub-questions:"""
         
         # ── New delegation tools ───────────────────────────────────────────────
 
-        def delegate_metadata(
-            question: Annotated[
-                str,
-                Field(description="The schema/metadata question or the user question for which UC metadata is needed"),
-            ]
+        def _run_metadata(
+            question: str,
+            ontology_context: str = "",
+            require_metadata_mapping: bool = False,
         ) -> str:
             """
-            Delegate a metadata/schema question to MetadataAgent.
-            Before calling, emit a user-visible working sentence that explicitly names MetadataAgent
-            and explains which business concepts, tables, or fields it should establish.
-            Use this when:
-            - The user asks about table structures, column names, or data descriptions.
-            - DataInsightAgent needs schema context before writing a query.
-            Returns a YAML/markdown schema summary from Unity Catalog.
+            Run MetadataAgent for authoritative UC facts, optionally verifying ontology hints.
             """
             logger.info(f"[Tool] delegate_metadata called: '{question[:80]}'")
             tool_started_at = time.perf_counter()
@@ -994,90 +1024,447 @@ Sub-questions:"""
                     else None
                 ),
             )
-            result_container: Dict[str, Any] = {"result": None, "error": None}
+            result_container: Dict[str, Any] = {
+                "result": None,
+                "error": None,
+                "loop": None,
+                "task": None,
+                "tool_results": [],
+            }
 
             def _run():
                 import asyncio
+
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                result_container["loop"] = loop
                 try:
-                    result_container["result"] = loop.run_until_complete(
+                    task = loop.create_task(
                         collect_nested_agent_stream(
-                            self.metadata_agent.query_stream(question),
+                            self.metadata_agent.query_stream(
+                                question,
+                                ontology_context=ontology_context,
+                                require_metadata_mapping=require_metadata_mapping,
+                                context_sink=result_container["tool_results"],
+                            ),
                             agent="MetadataAgent",
                             parent_id=agent_activity_id,
                             stream_final_text=False,
                         )
                     )
-                except Exception as exc:
+                    result_container["task"] = task
+                    result_container["result"] = loop.run_until_complete(task)
+                except BaseException as exc:
                     result_container["error"] = exc
                 finally:
                     pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
                     for task in pending:
                         task.cancel()
                     if pending:
-                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
                     loop.run_until_complete(loop.shutdown_asyncgens())
                     loop.close()
 
-            t = start_context_thread(_run, daemon=True)
-            thread_finished = wait_for_context_thread(t, 90)
-
+            thread = start_context_thread(_run, daemon=True)
+            thread_finished = wait_for_context_thread(
+                thread,
+                DatabricksConfig.METADATA_AGENT_TIMEOUT_SECONDS,
+            )
             if not thread_finished:
+                loop = result_container.get("loop")
+                task = result_container.get("task")
+                if loop is not None and task is not None:
+                    try:
+                        loop.call_soon_threadsafe(task.cancel)
+                    except RuntimeError:
+                        pass
                 turn = self._current_turn()
                 if turn is not None and turn.cancelled:
-                    return "Metadata lookup cancelled by user."
+                    reason = "Metadata lookup cancelled by user"
+                else:
+                    reason = (
+                        "MetadataAgent timed out after "
+                        f"{DatabricksConfig.METADATA_AGENT_TIMEOUT_SECONDS} seconds"
+                    )
                 finish_agent_activity(
                     agent_activity_id,
                     "MetadataAgent",
                     question,
                     agent_started_at,
                     error=True,
-                    summary="Metadata lookup timed out",
+                    summary=reason,
                 )
                 self._record_tool_outcome(
                     "delegate_metadata",
                     success=False,
-                    summary="Metadata lookup timed out",
+                    summary=reason,
                     started_at=tool_started_at,
                 )
-                return "Metadata lookup timed out."
+                return (
+                    "Metadata lookup cancelled by user."
+                    if turn is not None and turn.cancelled
+                    else f"MetadataAgent error: {reason}"
+                )
+
             if result_container["error"]:
+                exc = result_container["error"]
                 finish_agent_activity(
                     agent_activity_id,
                     "MetadataAgent",
                     question,
                     agent_started_at,
                     error=True,
-                    summary=str(result_container["error"])[:160],
+                    summary=str(exc)[:160],
                 )
                 self._record_tool_outcome(
                     "delegate_metadata",
                     success=False,
-                    summary=str(result_container["error"]),
+                    summary=str(exc),
                     started_at=tool_started_at,
                 )
-                return f"MetadataAgent error: {result_container['error']}"
+                return f"MetadataAgent error: {exc}"
+
+            agent_summary = str(result_container["result"] or "").strip()
+            if not agent_summary:
+                return "No metadata returned."
+            tool_results = result_container["tool_results"]
+            if not tool_results:
+                return (
+                    "MetadataAgent error: no grounded Unity Catalog tool results "
+                    "were produced."
+                )
+            metadata_result = self.metadata_agent.build_collected_context(
+                agent_summary,
+                tool_results,
+            )
+            detail_count = sum(
+                item.get("tool") == "get_table_details"
+                for item in tool_results
+            )
+            cache_hit_count = sum(
+                bool((item.get("result") or {}).get("cache_hit"))
+                for item in tool_results
+                if isinstance(item.get("result"), dict)
+            )
+
             finish_agent_activity(
                 agent_activity_id,
                 "MetadataAgent",
                 question,
                 agent_started_at,
-                summary="Step 1 completed: schema context prepared",
+                summary=(
+                    (
+                        "Step 2 completed: MetadataAgent verified ontology hints "
+                        "against Unity Catalog"
+                    )
+                    if ontology_context
+                    else "Step 1 completed: MetadataAgent resolved UC schema context"
+                ),
+                metrics={
+                    "tool_result_count": len(tool_results),
+                    "table_detail_count": detail_count,
+                    "cache_hit_count": cache_hit_count,
+                    "model_summary_chars": len(agent_summary),
+                },
             )
-            metadata_result = result_container["result"] or "No metadata returned."
             self._record_tool_outcome(
                 "delegate_metadata",
-                success=metadata_result != "No metadata returned.",
-                summary=(
-                    "Relevant schema context prepared"
-                    if metadata_result != "No metadata returned."
-                    else metadata_result
-                ),
-                metadata={"result_chars": len(metadata_result)},
+                success=True,
+                summary="Authoritative Unity Catalog schema context prepared",
+                metadata={
+                    "result_chars": len(metadata_result),
+                    "tool_result_count": len(tool_results),
+                    "table_detail_count": detail_count,
+                    "cache_hit_count": cache_hit_count,
+                },
                 started_at=tool_started_at,
             )
             return metadata_result
+
+        def delegate_metadata(
+            question: Annotated[
+                str,
+                Field(description="The schema/metadata question or the user question for which UC metadata is needed"),
+            ],
+        ) -> str:
+            """Delegate a metadata-only request to MetadataAgent."""
+            return _run_metadata(question)
+
+        def _run_ontology(question: str, schema_context: str = "") -> str:
+            """Run OntologyAgent as the semantic discovery stage."""
+            logger.info(f"[Pipeline] OntologyAgent starting: '{question[:80]}'")
+            tool_started_at = time.perf_counter()
+            agent_activity_id, agent_started_at = start_agent_activity(
+                "OntologyAgent",
+                question,
+                parent_id=(
+                    self._current_turn().progress.get("data_pipeline_activity_id")
+                    if self._current_turn() is not None
+                    else None
+                ),
+            )
+
+            ontology_agent = getattr(self, "ontology_agent", None)
+            if ontology_agent is None:
+                reason = "OntologyAgent is not available"
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=reason,
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=False,
+                    retryable=False,
+                    summary=reason,
+                    started_at=tool_started_at,
+                )
+                return f"OntologyAgent error: {reason}"
+
+            result_container: Dict[str, Any] = {
+                "result": None,
+                "error": None,
+                "loop": None,
+                "task": None,
+                "tool_results": [],
+                "runtime_tool_calls": [],
+            }
+
+            def _run():
+                import asyncio
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result_container["loop"] = loop
+                try:
+                    task = loop.create_task(
+                        collect_nested_agent_stream(
+                            ontology_agent.query_stream(
+                                question,
+                                schema_context=schema_context,
+                                context_sink=result_container["tool_results"],
+                            ),
+                            agent="OntologyAgent",
+                            parent_id=agent_activity_id,
+                            stream_final_text=False,
+                            tool_call_sink=result_container["runtime_tool_calls"],
+                        )
+                    )
+                    result_container["task"] = task
+                    result_container["result"] = loop.run_until_complete(task)
+                except BaseException as exc:
+                    result_container["error"] = exc
+                finally:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+
+            thread = start_context_thread(_run, daemon=True)
+            thread_finished = wait_for_context_thread(
+                thread,
+                OntologyConfig.AGENT_TIMEOUT_SECONDS,
+            )
+            if not thread_finished:
+                loop = result_container.get("loop")
+                task = result_container.get("task")
+                if loop is not None and task is not None:
+                    try:
+                        loop.call_soon_threadsafe(task.cancel)
+                    except RuntimeError:
+                        pass
+                reason = (
+                    "OntologyAgent timed out after "
+                    f"{OntologyConfig.AGENT_TIMEOUT_SECONDS} seconds"
+                )
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=reason,
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=False,
+                    summary=reason,
+                    started_at=tool_started_at,
+                )
+                return f"OntologyAgent error: {reason}"
+
+            if result_container["error"]:
+                exc = result_container["error"]
+                reason = str(exc)
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=reason[:160],
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=False,
+                    summary=reason,
+                    started_at=tool_started_at,
+                )
+                return f"OntologyAgent error: {reason}"
+
+            raw_result = ontology_agent.build_collected_context(
+                str(result_container["result"] or "").strip(),
+                result_container["tool_results"],
+            )
+
+            try:
+                parsed = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                reason = f"OntologyAgent returned malformed JSON: {exc}"
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=reason[:160],
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=False,
+                    summary=reason,
+                    started_at=tool_started_at,
+                )
+                return f"OntologyAgent error: {reason}"
+
+            if parsed.get("route") == "governed_skill":
+                governed_skill = parsed.get("governed_skill")
+                skill_name = (
+                    governed_skill.get("skill_name")
+                    if isinstance(governed_skill, dict)
+                    else None
+                )
+                resource_name = (
+                    governed_skill.get("resource_name")
+                    if isinstance(governed_skill, dict)
+                    else None
+                )
+                skill_loaded = any(
+                    call.get("name") == "load_skill"
+                    and call.get("arguments", {}).get("skill_name") == skill_name
+                    and not call.get("error")
+                    for call in result_container["runtime_tool_calls"]
+                )
+                valid_route = (
+                    isinstance(skill_name, str)
+                    and skill_name in configured_skill_names("OntologyAgent")
+                    and isinstance(resource_name, str)
+                    and configured_skill_resource_exists(
+                        "OntologyAgent",
+                        skill_name,
+                        resource_name,
+                    )
+                    and skill_loaded
+                )
+                if not valid_route:
+                    reason = (
+                        "OntologyAgent returned an unvalidated governed Skill route"
+                    )
+                    finish_agent_activity(
+                        agent_activity_id,
+                        "OntologyAgent",
+                        question,
+                        agent_started_at,
+                        error=True,
+                        summary=reason,
+                    )
+                    return f"OntologyAgent error: {reason}"
+
+                normalized_result = json.dumps(
+                    parsed,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    summary="Governed analytics Skill matched; ontology lookup skipped",
+                    metrics={
+                        "skill_fast_path": True,
+                        "skill_name": skill_name,
+                        "native_agent_loop": True,
+                    },
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=True,
+                    summary="Governed analytics Skill route prepared",
+                    metadata={"skill_name": skill_name},
+                    started_at=tool_started_at,
+                )
+                return normalized_result
+
+            primary_context = parsed.get("primary_business_context")
+            usable = bool(result_container["tool_results"]) and isinstance(
+                primary_context,
+                dict,
+            )
+            if not usable or parsed.get("status") == "error":
+                reason = "OntologyAgent returned no usable business context"
+                finish_agent_activity(
+                    agent_activity_id,
+                    "OntologyAgent",
+                    question,
+                    agent_started_at,
+                    error=True,
+                    summary=reason,
+                )
+                self._record_tool_outcome(
+                    "ontology_context",
+                    success=False,
+                    summary=reason,
+                    started_at=tool_started_at,
+                )
+                return f"OntologyAgent error: {reason}"
+
+            normalized_result = json.dumps(parsed, ensure_ascii=False, indent=2)
+            finish_agent_activity(
+                agent_activity_id,
+                "OntologyAgent",
+                question,
+                agent_started_at,
+                summary="Step 1 completed: ontology business context prepared",
+                metrics={
+                    "result_chars": len(normalized_result),
+                    "tool_result_count": len(result_container["tool_results"]),
+                    "reasoning_status": getattr(
+                        getattr(ontology_agent, "ontology_service", None),
+                        "reasoning_status",
+                        "unknown",
+                    ),
+                    "native_agent_loop": True,
+                },
+            )
+            self._record_tool_outcome(
+                "ontology_context",
+                success=True,
+                summary="Ontology business context prepared",
+                metadata={"result_chars": len(normalized_result)},
+                started_at=tool_started_at,
+            )
+            return normalized_result
 
         def _run_data_insight(
             question: Annotated[
@@ -1087,6 +1474,22 @@ Sub-questions:"""
             schema_context: Annotated[
                 str,
                 Field(description="Optional schema context previously returned by delegate_metadata"),
+            ] = "",
+            ontology_context: Annotated[
+                str,
+                Field(description="Optional structured context returned by OntologyAgent"),
+            ] = "",
+            ontology_fallback: Annotated[
+                str,
+                Field(description="Optional reason ontology enrichment was unavailable"),
+            ] = "",
+            ontology_enabled: Annotated[
+                bool,
+                Field(description="Whether ontology was requested for this session"),
+            ] = False,
+            governed_skill_context: Annotated[
+                str,
+                Field(description="Optional governed Skill route selected upstream"),
             ] = "",
         ) -> str:
             """
@@ -1146,6 +1549,10 @@ Sub-questions:"""
                             self.data_insight_agent.query_stream(
                                 downstream_question,
                                 schema_context=schema_context,
+                                ontology_context=ontology_context,
+                                ontology_fallback=ontology_fallback,
+                                ontology_enabled=ontology_enabled,
+                                governed_skill_context=governed_skill_context,
                             ),
                             agent="DataInsightAgent",
                             parent_id=agent_activity_id,
@@ -1227,7 +1634,7 @@ Sub-questions:"""
                 "DataInsightAgent",
                 question,
                 agent_started_at,
-                summary="Step 2 completed: SQL analysis completed",
+                summary="Final step completed: SQL analysis completed",
             )
             self._record_tool_outcome(
                 "data_insight",
@@ -1243,27 +1650,94 @@ Sub-questions:"""
                 str,
                 Field(
                     description=(
-                        "The complete data-analysis question. This deterministic pipeline first "
-                        "retrieves schema context with MetadataAgent, then immediately delegates "
-                        "the same question and schema context to DataInsightAgent."
+                        "The complete data-analysis question. When enabled, this pipeline first runs "
+                        "OntologyAgent for semantic discovery, then MetadataAgent for physical Unity "
+                        "Catalog verification, and delegates both contexts to DataInsightAgent. "
+                        "Ontology failure falls back to metadata-only."
                     )
                 ),
             ]
         ) -> str:
-            """Run the required MetadataAgent → DataInsightAgent pipeline without another MasterAgent turn."""
+            """Run the configured ontology/metadata/data pipeline without another MasterAgent turn."""
             logger.info(f"[Tool] delegate_data_analysis called: '{question[:80]}'")
             tool_started_at = time.perf_counter()
             pipeline_id = new_activity_id("data-pipeline")
-            push_stream_event("activity", pipeline_activity(pipeline_id, question))
             turn = self._current_turn()
+            ontology_requested = (
+                turn.enable_ontology
+                if turn is not None
+                else AppConfig.DEFAULT_ENABLE_ONTOLOGY
+            )
+            push_stream_event(
+                "activity",
+                pipeline_activity(
+                    pipeline_id,
+                    question,
+                    metrics={"ontology_requested": ontology_requested},
+                ),
+            )
             previous_pipeline_id = None
             if turn is not None:
                 previous_pipeline_id = turn.progress.get("data_pipeline_activity_id")
                 turn.progress["data_pipeline_activity_id"] = pipeline_id
 
             try:
-                metadata_result = delegate_metadata(question)
-                if turn is not None and turn.cancelled:
+                ontology_context = ""
+                ontology_fallback = ""
+                governed_skill_context = ""
+
+                if ontology_requested:
+                    ontology_result = _run_ontology(question)
+                    if turn is not None and turn.cancelled:
+                        push_stream_event(
+                            "activity",
+                            pipeline_activity(
+                                pipeline_id,
+                                question,
+                                state="error",
+                                duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
+                                summary="Stopped by user after OntologyAgent",
+                            ),
+                        )
+                        return "Data-analysis pipeline cancelled by user."
+                    if ontology_result.startswith("OntologyAgent error:"):
+                        ontology_fallback = ontology_result.split(":", 1)[1].strip()
+                        push_stream_event(
+                            "activity",
+                            stage_activity(
+                                f"{pipeline_id}-ontology-fallback",
+                                pipeline_id,
+                                "MasterAgent",
+                                "Ontology enrichment unavailable; continuing with standard metadata-driven analysis",
+                                state="completed",
+                                detail=ontology_fallback[:1000],
+                                category="fallback",
+                                metrics={
+                                    "ontology_requested": True,
+                                    "ontology_applied": False,
+                                    "fallback_used": True,
+                                },
+                            ),
+                        )
+                    else:
+                        parsed_ontology = json.loads(ontology_result)
+                        if parsed_ontology.get("route") == "governed_skill":
+                            governed_skill_context = json.dumps(
+                                parsed_ontology["governed_skill"],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        else:
+                            ontology_context = ontology_result
+
+                metadata_result = ""
+                if not governed_skill_context:
+                    metadata_result = _run_metadata(
+                        question,
+                        ontology_context=ontology_context,
+                        require_metadata_mapping=not bool(ontology_context),
+                    )
+                if not governed_skill_context and turn is not None and turn.cancelled:
                     push_stream_event(
                         "activity",
                         pipeline_activity(
@@ -1275,11 +1749,13 @@ Sub-questions:"""
                         ),
                     )
                     return "Data-analysis pipeline cancelled by user."
-                if metadata_result.startswith("MetadataAgent error:") or metadata_result in {
-                    "Metadata lookup timed out.",
+                if not governed_skill_context and (
+                    metadata_result.startswith("MetadataAgent error:")
+                    or metadata_result in {
                     "MetadataAgent is not available. Please ensure it is initialised.",
                     "No metadata returned.",
-                }:
+                    }
+                ):
                     self._record_tool_outcome(
                         "delegate_data_analysis",
                         success=False,
@@ -1293,17 +1769,36 @@ Sub-questions:"""
                             question,
                             state="error",
                             duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
-                            summary="Stopped after MetadataAgent failed",
+                            summary=(
+                                "Ontology semantics were found, but Unity Catalog "
+                                "physical verification failed"
+                                if ontology_context
+                                else "Stopped after MetadataAgent failed"
+                            ),
                         ),
                     )
                     return metadata_result
 
-                result = _run_data_insight(question, schema_context=metadata_result)
+                result = _run_data_insight(
+                    question,
+                    schema_context=metadata_result,
+                    ontology_context=ontology_context,
+                    ontology_fallback=ontology_fallback,
+                    ontology_enabled=ontology_requested,
+                    governed_skill_context=governed_skill_context,
+                )
                 success = result.startswith("[STREAMED]")
+                pipeline_metadata = {
+                    "ontology_requested": ontology_requested,
+                    "ontology_applied": bool(ontology_context),
+                    "fallback_used": bool(ontology_fallback),
+                    "skill_fast_path": bool(governed_skill_context),
+                }
                 self._record_tool_outcome(
                     "delegate_data_analysis",
                     success=success,
                     summary=("Data-analysis pipeline completed" if success else result),
+                    metadata=pipeline_metadata,
                     started_at=tool_started_at,
                 )
                 push_stream_event(
@@ -1314,10 +1809,21 @@ Sub-questions:"""
                         state="completed" if success else "error",
                         duration_ms=round((time.perf_counter() - tool_started_at) * 1000),
                         summary=(
-                            "MetadataAgent → DataInsightAgent completed in sequence"
+                            (
+                                "OntologyAgent Skill route → DataInsightAgent completed"
+                                if governed_skill_context
+                                else "OntologyAgent → MetadataAgent → DataInsightAgent completed in sequence"
+                                if ontology_context
+                                else (
+                                    "OntologyAgent failed → MetadataAgent → DataInsightAgent fallback completed"
+                                    if ontology_fallback
+                                    else "MetadataAgent → DataInsightAgent completed in sequence"
+                                )
+                            )
                             if success
                             else "DataInsightAgent did not complete"
                         ),
+                        metrics=pipeline_metadata,
                     ),
                 )
                 return result
@@ -1350,6 +1856,7 @@ Sub-questions:"""
 - Semantic Reranker: {'ENABLED' if self.search_agent.search_tool.enable_semantic_reranker else 'DISABLED'}
 - DataInsightAgent: {'AVAILABLE' if self.data_insight_agent else 'NOT CONFIGURED'}
 - MetadataAgent: {'AVAILABLE' if self.metadata_agent else 'NOT CONFIGURED'}
+- OntologyAgent: {'AVAILABLE' if self.ontology_agent else 'NOT CONFIGURED'}
 
 Remember: When agentic retrieval is {agentic_status}, follow the corresponding workflow described above."""
         
@@ -1377,7 +1884,8 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
     async def chat(
         self,
         message: str,
-        thread=None
+        thread=None,
+        enable_ontology: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Process a user message and generate a response.
@@ -1390,7 +1898,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             Agent response with text and metadata
         """
         logger.info(f"MasterAgent.chat called with message: '{message}'")
-        turn = self._new_turn(message)
+        turn = self._new_turn(message, enable_ontology=enable_ontology)
         context_var = self._turn_context_var()
         token = context_var.set(turn)
 
@@ -1412,6 +1920,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         thread=None,
         stream_context: Any = None,
         cancel_event: Optional[Event] = None,
+        enable_ontology: Optional[bool] = None,
     ):
         """
         Process a user message with streaming response.
@@ -1429,6 +1938,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             message,
             stream_context=stream_context,
             cancel_event=cancel_event,
+            enable_ontology=enable_ontology,
         )
         context_var = self._turn_context_var()
         token = context_var.set(turn)

@@ -2,19 +2,100 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Sequence
 
-from agent_framework import FileSkillsSource, SkillsProvider, SkillsSourceContext
+from agent_framework import FileSkillsSource, Skill, SkillsProvider, SkillsSourceContext
 
 _PROJECT_ROOT = Path(__file__).parent.parent
 _SKILLS_ROOT = _PROJECT_ROOT / "skills"
 
 _AGENT_SKILL_DIRECTORIES: dict[str, tuple[str, ...]] = {
-    "DataInsightAgent": ("analytics-spec",),
+    "DataInsightAgent": ("analytics-spec", "ontology-sql-planning"),
     "MetadataAgent": ("metadata-mapping",),
+    "OntologyAgent": ("analytics-spec",),
 }
+
+
+@dataclass
+class _SkillUsage:
+    loaded_skills: set[str]
+    read_resources: set[tuple[str, str]]
+
+
+_SKILL_USAGE: ContextVar[Optional[_SkillUsage]] = ContextVar(
+    "agent_skill_usage",
+    default=None,
+)
+
+
+class _TrackingSkillsProvider(SkillsProvider):
+    """Record successful native Skill operations in the current request context."""
+
+    async def _load_skill(self, skills: Sequence[Skill], skill_name: str) -> str:
+        result = await super()._load_skill(skills, skill_name)
+        skill = self._find_skill(skills, skill_name)
+        if skill is not None and not result.startswith("Error:"):
+            usage = _SKILL_USAGE.get()
+            if usage is not None:
+                usage.loaded_skills.add(skill.frontmatter.name.casefold())
+        return result
+
+    async def _read_skill_resource(
+        self,
+        skills: Sequence[Skill],
+        skill_name: str,
+        resource_name: str,
+        **kwargs: Any,
+    ) -> Any:
+        result = await super()._read_skill_resource(
+            skills,
+            skill_name,
+            resource_name,
+            **kwargs,
+        )
+        skill = self._find_skill(skills, skill_name)
+        failed = isinstance(result, str) and result.startswith("Error:")
+        if skill is not None and not failed:
+            usage = _SKILL_USAGE.get()
+            if usage is not None:
+                usage.read_resources.add(
+                    (
+                        skill.frontmatter.name.casefold(),
+                        resource_name.casefold(),
+                    )
+                )
+        return result
+
+
+def begin_skill_usage_tracking() -> Token[Optional[_SkillUsage]]:
+    """Start an isolated Skill-usage scope for one agent request."""
+    return _SKILL_USAGE.set(_SkillUsage(set(), set()))
+
+
+def reset_skill_usage_tracking(token: Token[Optional[_SkillUsage]]) -> None:
+    """Restore the Skill-usage scope that preceded a request."""
+    _SKILL_USAGE.reset(token)
+
+
+def skill_was_loaded(skill_name: str) -> bool:
+    """Return whether the named Skill was successfully loaded in this request."""
+    usage = _SKILL_USAGE.get()
+    return usage is not None and skill_name.casefold() in usage.loaded_skills
+
+
+def skill_resource_was_read(skill_name: str, resource_name: str) -> bool:
+    """Return whether the named Skill resource was read in this request."""
+    usage = _SKILL_USAGE.get()
+    if usage is None:
+        return False
+    return (
+        skill_name.casefold(),
+        resource_name.casefold(),
+    ) in usage.read_resources
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -39,7 +120,7 @@ def create_skills_provider(agent_name: str) -> Optional[SkillsProvider]:
     if not skill_paths:
         return None
 
-    return SkillsProvider.from_paths(
+    return _TrackingSkillsProvider.from_paths(
         skill_paths=skill_paths,
         resource_extensions=(".md", ".json", ".yaml", ".yml", ".csv", ".xml", ".txt", ".sql"),
         disable_caching=_env_flag("SKILLS_DISABLE_CACHING"),
@@ -53,6 +134,27 @@ def create_skills_provider(agent_name: str) -> Optional[SkillsProvider]:
 def configured_skill_names(agent_name: str) -> tuple[str, ...]:
     """Return the repository Skill names assigned to an agent."""
     return _AGENT_SKILL_DIRECTORIES.get(agent_name, ())
+
+
+def configured_skill_resource_exists(
+    agent_name: str,
+    skill_name: str,
+    resource_name: str,
+) -> bool:
+    """Return whether a resource is safely contained in an assigned Skill."""
+    if skill_name not in configured_skill_names(agent_name) or not resource_name:
+        return False
+    skill_root = (_SKILLS_ROOT / skill_name).resolve()
+    resource_path = (skill_root / resource_name).resolve()
+    return resource_path.is_relative_to(skill_root) and resource_path.is_file()
+
+
+def read_configured_skill(agent_name: str, skill_name: str) -> str:
+    """Read one repository-owned Skill assigned to an agent."""
+    if skill_name not in configured_skill_names(agent_name):
+        raise ValueError(f"Skill {skill_name!r} is not assigned to {agent_name}")
+    skill_path = _SKILLS_ROOT / skill_name / "SKILL.md"
+    return skill_path.read_text(encoding="utf-8")
 
 
 async def list_skill_metadata(agent) -> list[dict[str, object]]:

@@ -6,8 +6,9 @@ Before starting, ensure you have:
 
 - ✅ Python 3.10 or higher installed
 - ✅ Node.js 18+ installed (for the React frontend)
+- ✅ Java 11+ installed (for optional HermiT startup reasoning)
 - ✅ Azure subscription with active resources
-- ✅ Azure OpenAI service with GPT-5.1 deployment
+- ✅ Azure OpenAI service with primary and small tool-capable GPT deployments
 - ✅ Azure AI Search service with semantic search + vector search configured
 - ✅ text-embedding-3-large model deployed (3072 dimensions)
 - ✅ Azure Blob Storage container (for document/image URL resolution)
@@ -50,7 +51,8 @@ cd frontend && npm install && cd ..
    | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint URL |
    | `AZURE_OPENAI_AUTH_MODE` | `auto` \| `key` \| `aad` (default: `auto`) |
    | `AZURE_OPENAI_API_KEY` | API key — required when `AUTH_MODE=key` or `auto` |
-   | `AZURE_OPENAI_GPT_DEPLOYMENT` | Name of your GPT-5.1 deployment |
+   | `AZURE_OPENAI_GPT_DEPLOYMENT` | Primary deployment for MasterAgent and DataInsightAgent |
+   | `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT` | Smaller tool-capable deployment for OntologyAgent and MetadataAgent |
    | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Name of your text-embedding-3-large deployment |
    | `AZURE_SEARCH_ENDPOINT` | Azure AI Search endpoint URL |
    | `AZURE_SEARCH_API_KEY` | Azure AI Search admin/query key |
@@ -107,7 +109,32 @@ AZURE_IMAGE_SAS_TOKEN=sp=r&st=...&se=...&spr=https&sv=...&sr=c&sig=...
 
 Documents with no public URL are still cited as plain-text footnotes.
 
-### Step 5: (Optional) Configure Databricks
+### Step 5: Configure Ontology Runtime
+
+Owlready2 recursively loads repository OWL files without modifying them. Defaults:
+
+```env
+DEFAULT_ENABLE_ONTOLOGY=true
+ONTOLOGY_DIR=Ontology
+ONTOLOGY_FILE_GLOB=**/*.owl
+ONTOLOGY_ONLY_LOCAL=true
+ONTOLOGY_ENABLE_REASONER=false
+ONTOLOGY_REASONER=hermit
+ONTOLOGY_MAX_RESULTS=25
+ONTOLOGY_MAX_DEPTH=5
+ONTOLOGY_MAX_PATHS=10
+ONTOLOGY_MAX_NODES=250
+ONTOLOGY_FUZZY_THRESHOLD=0.62
+ONTOLOGY_AGENT_TIMEOUT_SECONDS=90
+```
+
+`DEFAULT_ENABLE_ONTOLOGY` initializes each new React session independently. The active session's switch is sent with each request and does not affect other sessions.
+
+The current OWL uses `xsd:date`, which HermiT does not support, so reasoning is disabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=true` only for a compatible ontology. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `ontology-sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
+
+The normal analytics handoff is linear and does not return to the Master LLM between sub-agents. If DataInsightAgent detects an unexpectedly missing or incomplete handoff, its own MAF loop may recover Metadata or enabled Ontology context once before continuing. Disabled Ontology and known upstream Ontology failures are never retried.
+
+### Step 6: (Optional) Configure Databricks
 
 For the DataInsightAgent and MetadataAgent:
 ```
@@ -115,12 +142,14 @@ DATABRICKS_HOST=https://adb-XXXX.XX.azuredatabricks.net/
 DATABRICKS_TOKEN=dapiXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
 DATABRICKS_CATALOG=<your-unity-catalog-name>
-DATABRICKS_SCHEMAS=silver,gold
+DATABRICKS_SCHEMAS=silver  # Add comma-separated schemas only when they actually exist
+DATABRICKS_METADATA_CACHE_TTL_SECONDS=900
 ```
 
 When these are not set, `DatabricksConfig.is_configured()` returns `False` and both agents are skipped.
+Metadata tools cache only objects they actually request: catalog schemas, table summaries for a specific schema, and details for a selected fully-qualified table. The cache is not question-scoped and never preloads every table's columns. Set the TTL to `0` for a process-lifetime object cache.
 
-### Step 6: Run the Application
+### Step 7: Run the Application
 
 ```bash
 ./run.sh             # Full stack: FastAPI (port 8000) + React (port 3000)
@@ -138,6 +167,14 @@ Open your browser to `http://localhost:3000` (React) or `http://localhost:8501` 
 ```bash
 source venv/bin/activate
 python -c "from src.config import validate_config; validate_config(); print('Config OK')"
+```
+
+### Test ontology loading
+
+```bash
+source venv/bin/activate
+python -c "from src.ontology import OntologyService; s=OntologyService(enable_reasoner=False).load(); print(s.health())"
+curl http://localhost:8000/config
 ```
 
 ### Test search tool

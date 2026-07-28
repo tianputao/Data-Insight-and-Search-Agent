@@ -11,23 +11,35 @@ Architecture
 
 Tools provided to the LLM
 --------------------------
-get_relevant_tables   — asks MetadataAgent for table metadata relevant to the question
 execute_sql           — runs a SQL string against the Databricks SQL warehouse and returns rows
+recover_metadata_context — re-runs MetadataAgent only when upstream schema context is missing/incomplete
+recover_ontology_context — re-runs OntologyAgent only when enabled context is unexpectedly missing
 load_skill            — loads the full body of a named skill into the conversation context
 """
 
 from __future__ import annotations
 
+import asyncio
+from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 import re
 import threading
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
-from ..config import DatabricksConfig
+from ..config import DatabricksConfig, OntologyConfig
 from ..prompts import DATA_INSIGHT_AGENT_PROMPT
-from ..skills_provider import create_skills_provider
+from ..skills_provider import (
+    begin_skill_usage_tracking,
+    create_skills_provider,
+    reset_skill_usage_tracking,
+    skill_resource_was_read,
+    skill_was_loaded,
+)
 from ..utils import get_logger
 from .maf_runtime import (
     create_agent as create_maf_agent,
@@ -41,11 +53,69 @@ logger = get_logger(__name__)
 # ─── Databricks connection singleton (avoids per-query cold-start) ────────────
 # Performance note: the biggest latency contributors are:
 #   1. Databricks warehouse cold-start (first connect ~3-10 s, warm ~<1 s)
-#   2. MetadataAgent round-trips to Unity Catalog SDK (~1-3 s each)
-#   3. Multiple LLM hops: MasterAgent → DataInsightAgent → MetadataAgent
+#   2. Native MetadataAgent and OntologyAgent model/tool iterations
+#   3. DataInsightAgent SQL generation and result interpretation
 # Reusing the JDBC connection eliminates the cold-start penalty for subsequent queries.
 _db_connection: Optional[Any] = None
 _db_lock = threading.Lock()
+
+
+def _validate_sql_scope(sql: str) -> Optional[str]:
+    """Return a blocking error when SQL references an unexposed UC object."""
+    try:
+        statements = [statement for statement in parse(sql, read="databricks") if statement]
+    except ParseError as exc:
+        return f"BLOCKED: SQL could not be parsed for catalog/schema validation: {exc}"
+    if len(statements) != 1:
+        return "BLOCKED: Exactly one SQL statement is permitted."
+
+    statement = statements[0]
+    cte_names = {
+        cte.alias_or_name.casefold()
+        for cte in statement.find_all(exp.CTE)
+        if cte.alias_or_name
+    }
+    configured_catalog = DatabricksConfig.CATALOG
+    configured_schemas = {
+        schema.casefold(): schema for schema in DatabricksConfig.SCHEMAS
+    }
+
+    for table in statement.find_all(exp.Table):
+        table_name = table.name
+        if (
+            not table.catalog
+            and not table.db
+            and table_name.casefold() in cte_names
+        ):
+            continue
+        if not table.catalog or not table.db:
+            return (
+                f"BLOCKED: Physical table '{table.sql(dialect='databricks')}' must use a "
+                "fully-qualified configured catalog.schema.table name."
+            )
+        if table.catalog.casefold() != configured_catalog.casefold():
+            return (
+                f"BLOCKED: Catalog '{table.catalog}' is outside the configured catalog "
+                f"'{configured_catalog}'."
+            )
+        if table.db.casefold() not in configured_schemas:
+            return (
+                f"BLOCKED: Schema '{table.db}' is outside DATABRICKS_SCHEMAS "
+                f"({', '.join(DatabricksConfig.SCHEMAS)})."
+            )
+    return None
+
+
+@dataclass
+class _RecoveryState:
+    question: str
+    schema_context: str
+    ontology_context: str
+    ontology_enabled: bool
+    ontology_fallback: str
+    governed_skill_context: str = ""
+    metadata_attempts: int = 0
+    ontology_attempts: int = 0
 
 
 def _get_db_connection():
@@ -122,24 +192,173 @@ class DataInsightAgent:
     def __init__(
         self,
         metadata_agent: Optional[Any] = None,  # MetadataAgent or None
+        ontology_agent: Optional[Any] = None,  # OntologyAgent or None
         agent_id: str = "data_insight_agent",
     ) -> None:
         """
         Parameters
         ----------
         metadata_agent:
-            Optional MetadataAgent instance.  When provided, the agent can call it
-            via the `get_relevant_tables` tool to retrieve schema context.
+            Optional MetadataAgent instance used only for grounded SQL identifier
+            correction and bounded recovery when upstream schema is missing.
+        ontology_agent:
+            Optional OntologyAgent instance used only for bounded recovery when
+            ontology was enabled but its context is unexpectedly missing.
         agent_id:
             Logical identifier for logging.
         """
         self.metadata_agent = metadata_agent
+        self.ontology_agent = ontology_agent
         self.agent_id = agent_id
+        self._recovery_state: ContextVar[Optional[_RecoveryState]] = ContextVar(
+            f"{agent_id}_recovery_state",
+            default=None,
+        )
 
         tools = self._create_tools()
         self.agent = self._create_agent(tools)
 
         logger.info(f"DataInsightAgent '{agent_id}' initialised successfully.")
+
+    @staticmethod
+    def _recovery_result(
+        status: str,
+        source: str,
+        *,
+        message: str = "",
+        reason: str = "",
+        context: str = "",
+    ) -> str:
+        parsed_context: Any = context
+        if context:
+            try:
+                parsed_context = json.loads(context)
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return json.dumps(
+            {
+                "status": status,
+                "source": source,
+                "reason": reason,
+                "message": message,
+                "context": parsed_context if context else None,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _original_question(question: str) -> str:
+        match = re.search(
+            r"(?is)<original_user_question>\s*(.*?)\s*</original_user_question>",
+            question,
+        )
+        return match.group(1).strip() if match else question.strip()
+
+    @staticmethod
+    def _schema_context_status(schema_context: str) -> str:
+        if not schema_context.strip():
+            return "missing"
+        try:
+            parsed = json.loads(schema_context)
+        except (TypeError, json.JSONDecodeError):
+            return "present_unstructured"
+        tool_results = parsed.get("all_tool_results", [])
+        has_details = any(
+            item.get("tool") == "get_table_details"
+            and isinstance(item.get("result"), dict)
+            and item["result"].get("status") == "ok"
+            and bool(item["result"].get("columns"))
+            for item in tool_results
+            if isinstance(item, dict)
+        )
+        return "ready" if has_details else "incomplete"
+
+    @staticmethod
+    def _ontology_context_status(
+        ontology_context: str,
+        *,
+        ontology_enabled: bool,
+        ontology_fallback: str,
+    ) -> str:
+        if not ontology_enabled:
+            return "disabled"
+        if ontology_fallback:
+            return "upstream_failed"
+        if not ontology_context.strip():
+            return "missing"
+        try:
+            parsed = json.loads(ontology_context)
+        except (TypeError, json.JSONDecodeError):
+            return "present_unstructured"
+        return (
+            "ready"
+            if isinstance(parsed.get("primary_business_context"), dict)
+            else "incomplete"
+        )
+
+    def _prepare_contextual_question(
+        self,
+        question: str,
+        *,
+        schema_context: str,
+        ontology_context: str,
+        ontology_fallback: str,
+        ontology_enabled: bool,
+        governed_skill_context: str = "",
+    ) -> tuple[_RecoveryState, str]:
+        state = _RecoveryState(
+            question=self._original_question(question),
+            schema_context=schema_context,
+            ontology_context=ontology_context,
+            ontology_enabled=ontology_enabled,
+            ontology_fallback=ontology_fallback,
+            governed_skill_context=governed_skill_context,
+        )
+        if governed_skill_context:
+            schema_status = "governed_skill"
+            ontology_status = "skipped_by_skill"
+        else:
+            schema_status = self._schema_context_status(schema_context)
+            ontology_status = self._ontology_context_status(
+                ontology_context,
+                ontology_enabled=ontology_enabled,
+                ontology_fallback=ontology_fallback,
+            )
+        required_actions = []
+        if schema_status in {"missing", "incomplete"}:
+            required_actions.append("recover_metadata_context before SQL")
+        if ontology_status in {"missing", "incomplete"}:
+            required_actions.append("recover_ontology_context before SQL")
+        context_blocks = [
+            (
+                "<context_recovery_status>\n"
+                f"schema={schema_status}\n"
+                f"ontology={ontology_status}\n"
+                "required_actions="
+                f"{'; '.join(required_actions) if required_actions else 'none'}\n"
+                "A successful recovery tool result supersedes these initial statuses.\n"
+                "</context_recovery_status>"
+            )
+        ]
+        if ontology_context:
+            context_blocks.append(
+                f"<ontology_context>\n{ontology_context}\n</ontology_context>"
+            )
+        if schema_context:
+            context_blocks.append(
+                f"<schema_context>\n{schema_context}\n</schema_context>"
+            )
+        if ontology_fallback:
+            context_blocks.append(
+                f"<ontology_fallback>\n{ontology_fallback}\n</ontology_fallback>"
+            )
+        if governed_skill_context:
+            context_blocks.append(
+                "<governed_skill_context>\n"
+                f"{governed_skill_context}\n"
+                "</governed_skill_context>"
+            )
+        return state, "\n\n".join([*context_blocks, question])
 
     # ─────────────────────────────────────────────────────────────────────────
     # Tool definitions
@@ -148,56 +367,180 @@ class DataInsightAgent:
     def _create_tools(self) -> List:
         """Return function tools registered with the LLM."""
 
-        def get_relevant_tables(
-            question: Annotated[
+        async def recover_metadata_context(
+            reason: Annotated[
                 str,
-                Field(description="The user question or analytical task description"),
-            ]
+                Field(
+                    description=(
+                        "Concrete missing table, column, join, or ambiguity that "
+                        "prevents grounded SQL generation"
+                    )
+                ),
+            ],
         ) -> str:
-            """
-            Retrieve schema metadata (tables, columns, descriptions, tags) relevant to
-            the question by delegating to MetadataAgent.
-            Call this BEFORE writing any SQL so you know the exact table and column names.
-            """
-            logger.info(f"[Tool:get_relevant_tables] question='{question[:80]}'")
-
+            """Recover schema context only when the upstream handoff is unusable."""
+            state = self._recovery_state.get()
+            if state is None:
+                return self._recovery_result(
+                    "error",
+                    "MetadataAgent",
+                    message="No active DataInsight recovery scope.",
+                )
+            if state.governed_skill_context:
+                return self._recovery_result(
+                    "not_required",
+                    "MetadataAgent",
+                    message="A governed Skill resource supplies the physical SQL contract.",
+                )
+            if state.metadata_attempts >= 1:
+                return self._recovery_result(
+                    "exhausted",
+                    "MetadataAgent",
+                    message="The one allowed metadata recovery attempt was already used.",
+                )
             if self.metadata_agent is None:
-                schemas_list = ", ".join(DatabricksConfig.SCHEMAS)
-                return (
-                    "MetadataAgent not configured. "
-                    f"Catalog: {DatabricksConfig.CATALOG}, "
-                    f"available schemas: {schemas_list}. "
-                    "Please infer table names from the question context."
+                return self._recovery_result(
+                    "unavailable",
+                    "MetadataAgent",
+                    message="MetadataAgent is not configured.",
                 )
 
-            # Delegate synchronously to metadata agent
-            result_container: Dict[str, Any] = {"result": None, "error": None}
+            state.metadata_attempts += 1
+            logger.warning(
+                "[Tool:recover_metadata_context] reason='%s'",
+                reason[:240],
+            )
+            try:
+                recovered = await asyncio.wait_for(
+                    self.metadata_agent.query(
+                        state.question,
+                        ontology_context=state.ontology_context,
+                        require_metadata_mapping=not bool(state.ontology_context),
+                    ),
+                    timeout=DatabricksConfig.METADATA_AGENT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                return self._recovery_result(
+                    "timeout",
+                    "MetadataAgent",
+                    message=(
+                        "Metadata recovery timed out after "
+                        f"{DatabricksConfig.METADATA_AGENT_TIMEOUT_SECONDS} seconds."
+                    ),
+                )
+            except Exception as exc:
+                return self._recovery_result(
+                    "error",
+                    "MetadataAgent",
+                    message=str(exc),
+                )
 
-            def _run():
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result_container["result"] = loop.run_until_complete(
-                        self.metadata_agent.query(question)
+            state.schema_context = recovered
+            return self._recovery_result(
+                "ok",
+                "MetadataAgent",
+                reason=reason,
+                context=recovered,
+            )
+
+        async def recover_ontology_context(
+            reason: Annotated[
+                str,
+                Field(
+                    description=(
+                        "Concrete missing business meaning, relationship, hierarchy, "
+                        "factor, or lineage needed for deeper analysis"
                     )
-                except Exception as exc:
-                    result_container["error"] = exc
-                finally:
-                    loop.close()
+                ),
+            ],
+        ) -> str:
+            """Recover ontology context only when that session requested ontology."""
+            state = self._recovery_state.get()
+            if state is None:
+                return self._recovery_result(
+                    "error",
+                    "OntologyAgent",
+                    message="No active DataInsight recovery scope.",
+                )
+            if state.governed_skill_context:
+                return self._recovery_result(
+                    "not_required",
+                    "OntologyAgent",
+                    message="Ontology discovery was intentionally skipped by a governed Skill route.",
+                )
+            if not state.ontology_enabled:
+                return self._recovery_result(
+                    "disabled",
+                    "OntologyAgent",
+                    message="Ontology is disabled for this request.",
+                )
+            if state.ontology_fallback:
+                return self._recovery_result(
+                    "upstream_failed",
+                    "OntologyAgent",
+                    message=(
+                        "The upstream OntologyAgent already failed; it will not be "
+                        "retried inside DataInsightAgent."
+                    ),
+                )
+            if state.ontology_attempts >= 1:
+                return self._recovery_result(
+                    "exhausted",
+                    "OntologyAgent",
+                    message="The one allowed ontology recovery attempt was already used.",
+                )
+            if self.ontology_agent is None:
+                return self._recovery_result(
+                    "unavailable",
+                    "OntologyAgent",
+                    message="OntologyAgent is not configured.",
+                )
+            if not state.schema_context.strip():
+                return self._recovery_result(
+                    "requires_metadata",
+                    "OntologyAgent",
+                    message=(
+                        "Recover MetadataAgent context first so ontology semantics can "
+                        "be checked against physical schema."
+                    ),
+                )
 
-            t = threading.Thread(target=_run)
-            t.start()
-            t.join(timeout=60)
+            state.ontology_attempts += 1
+            logger.warning(
+                "[Tool:recover_ontology_context] reason='%s'",
+                reason[:240],
+            )
+            try:
+                recovered = await asyncio.wait_for(
+                    self.ontology_agent.query(
+                        state.question,
+                        schema_context=state.schema_context,
+                    ),
+                    timeout=OntologyConfig.AGENT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                return self._recovery_result(
+                    "timeout",
+                    "OntologyAgent",
+                    message=(
+                        "Ontology recovery timed out after "
+                        f"{OntologyConfig.AGENT_TIMEOUT_SECONDS} seconds."
+                    ),
+                )
+            except Exception as exc:
+                return self._recovery_result(
+                    "error",
+                    "OntologyAgent",
+                    message=str(exc),
+                )
 
-            if t.is_alive():
-                return "Metadata lookup timed out after 60 s."
-            if result_container["error"]:
-                logger.error(f"[Tool:get_relevant_tables] MetadataAgent error: {result_container['error']}")
-                return f"Metadata error: {result_container['error']}"
-            response = result_container["result"] or "No metadata returned."
-            logger.debug(f"[Tool:get_relevant_tables] MetadataAgent returned:\n{response[:500]}")
-            return response
+            state.ontology_context = recovered
+            return self._recovery_result(
+                "ok",
+                "OntologyAgent",
+                reason=reason,
+                context=recovered,
+            )
 
         def execute_sql(
             sql: Annotated[
@@ -216,12 +559,47 @@ class DataInsightAgent:
             """
             logger.info(f"[Tool:execute_sql] Executing SQL (max_rows={max_rows}):\n{sql}")
 
+            state = self._recovery_state.get()
+            required_skill = "ontology-sql-planning"
+            required_resource = ""
+            if state is not None and state.governed_skill_context:
+                try:
+                    governed = json.loads(state.governed_skill_context)
+                except (TypeError, json.JSONDecodeError):
+                    governed = {}
+                required_skill = str(governed.get("skill_name") or "")
+                required_resource = str(governed.get("resource_name") or "")
+                if not required_skill or not required_resource:
+                    return (
+                        "BLOCKED: Governed Skill context is invalid. A validated Skill and "
+                        "indexed resource are required before SQL execution."
+                    )
+
+            if state is not None and not skill_was_loaded(required_skill):
+                return (
+                    f"BLOCKED: Required Skill '{required_skill}' has not been loaded in this "
+                    "request. Call load_skill before execute_sql."
+                )
+            if (
+                state is not None
+                and required_resource
+                and not skill_resource_was_read(required_skill, required_resource)
+            ):
+                return (
+                    f"BLOCKED: Required Skill resource '{required_resource}' has not been read "
+                    "in this request. Call read_skill_resource before execute_sql."
+                )
+
             # Safety: block data-modification statements
             sql_upper = sql.strip().upper()
             forbidden = ("INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE")
             for kw in forbidden:
                 if sql_upper.startswith(kw) or f" {kw} " in sql_upper:
                     return f"BLOCKED: '{kw}' statements are not permitted. Only SELECT is allowed."
+
+            scope_error = _validate_sql_scope(sql)
+            if scope_error:
+                return scope_error
 
             max_rows = min(max(1, max_rows), DatabricksConfig.MAX_ROWS)
 
@@ -256,6 +634,19 @@ class DataInsightAgent:
 
             try:
                 active_sql = sql
+                corrections: list[dict[str, str]] = []
+                if self.metadata_agent is not None and hasattr(
+                    self.metadata_agent,
+                    "rewrite_sql_identifiers",
+                ):
+                    active_sql, corrections = self.metadata_agent.rewrite_sql_identifiers(
+                        active_sql
+                    )
+                    if corrections:
+                        logger.info(
+                            "[Tool:execute_sql] Corrected SQL identifiers from UC metadata: %s",
+                            corrections,
+                        )
                 try:
                     result = _run_databricks_query(active_sql, max_rows=max_rows)
                 except Exception as first_exc:
@@ -310,7 +701,11 @@ class DataInsightAgent:
                 logger.error(f"[Tool:execute_sql] Unexpected error: {exc}", exc_info=True)
                 return f"Query execution failed: {exc}"
 
-        return [get_relevant_tables, execute_sql]
+        return [
+            recover_metadata_context,
+            recover_ontology_context,
+            execute_sql,
+        ]
 
     # ─────────────────────────────────────────────────────────────────────────
     # Agent creation
@@ -356,6 +751,10 @@ class DataInsightAgent:
         question: str,
         thread=None,
         schema_context: str = "",
+        ontology_context: str = "",
+        ontology_fallback: str = "",
+        ontology_enabled: bool = False,
+        governed_skill_context: str = "",
     ) -> str:
         """
         Ask a data-related question.  The agent generates SQL, executes it, and
@@ -371,29 +770,56 @@ class DataInsightAgent:
             Optional pre-fetched metadata from MetadataAgent to prepend.
         """
         logger.info(f"DataInsightAgent.query: '{question[:80]}'")
+        state, full_question = self._prepare_contextual_question(
+            question,
+            schema_context=schema_context,
+            ontology_context=ontology_context,
+            ontology_fallback=ontology_fallback,
+            ontology_enabled=ontology_enabled,
+            governed_skill_context=governed_skill_context,
+        )
+        token = self._recovery_state.set(state)
+        skill_token = begin_skill_usage_tracking()
+        try:
+            result = await run_agent(self.agent, full_question, session=thread)
+            logger.info(f"DataInsightAgent.query completed, len={len(result.text)}")
+            return result.text
+        finally:
+            reset_skill_usage_tracking(skill_token)
+            self._recovery_state.reset(token)
 
-        full_question = question
-        if schema_context:
-            full_question = (
-                f"<schema_context>\n{schema_context}\n</schema_context>\n\n{question}"
-            )
-
-        result = await run_agent(self.agent, full_question, session=thread)
-        logger.info(f"DataInsightAgent.query completed, len={len(result.text)}")
-        return result.text
-
-    async def query_stream(self, question: str, thread=None, schema_context: str = ""):
+    async def query_stream(
+        self,
+        question: str,
+        thread=None,
+        schema_context: str = "",
+        ontology_context: str = "",
+        ontology_fallback: str = "",
+        ontology_enabled: bool = False,
+        governed_skill_context: str = "",
+    ):
         """
         Streaming version of :meth:`query`.  Yields MAF update objects.
         Used by the FastAPI SSE endpoint.
         """
         logger.info(f"DataInsightAgent.query_stream: '{question[:80]}'")
-
-        full_question = question
-        if schema_context:
-            full_question = (
-                f"<schema_context>\n{schema_context}\n</schema_context>\n\n{question}"
-            )
-
-        async for update in stream_agent(self.agent, full_question, session=thread):
-            yield update
+        state, full_question = self._prepare_contextual_question(
+            question,
+            schema_context=schema_context,
+            ontology_context=ontology_context,
+            ontology_fallback=ontology_fallback,
+            ontology_enabled=ontology_enabled,
+            governed_skill_context=governed_skill_context,
+        )
+        token = self._recovery_state.set(state)
+        skill_token = begin_skill_usage_tracking()
+        try:
+            async for update in stream_agent(
+                self.agent,
+                full_question,
+                session=thread,
+            ):
+                yield update
+        finally:
+            reset_skill_usage_tracking(skill_token)
+            self._recovery_state.reset(token)

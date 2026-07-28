@@ -4,7 +4,7 @@
 
 ### Overview
 
-The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** built on the Microsoft Agent Framework (MAF). The system supports both knowledge retrieval (Azure AI Search) and structured data analytics (Azure Databricks Unity Catalog) through four specialized agents, a plugin-based skill system, and a streaming FastAPI backend.
+The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** built on the Microsoft Agent Framework (MAF). The system supports knowledge retrieval (Azure AI Search), read-only OWL business semantics (Owlready2), and structured data analytics (Azure Databricks Unity Catalog) through five agents, a plugin-based skill system, and a streaming FastAPI backend.
 
 ## 📊 Architecture Diagram
 
@@ -23,7 +23,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                       MasterAgent  (GPT-5.1)                     │
+│                  MasterAgent  (primary GPT deployment)           │
 │  ┌──────────────────┐  ┌────────────────┐  ┌─────────────────┐  │
 │  │ decompose_query  │  │ search_multiple│  │ search_knowledge│  │
 │  │                  │  │ _queries       │  │                 │  │
@@ -32,35 +32,31 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │  │delegate_metadata │  │delegate_data   │  SkillsProvider scopes   │
 │  │                  │  │_insight        │  skills per sub-agent    │
 │  └──────────────────┘  └────────────────┘                        │
-└────┬─────────────────┬────────────────────┬───────────────────────┘
-     │                 │                    │
-     ▼                 ▼                    ▼
-┌──────────┐  ┌────────────────┐  ┌────────────────────────┐
-│ Search   │  │ MetadataAgent  │  │  DataInsightAgent       │
-│ Agent    │  │                │  │                         │
-│          │  │ list_schemas   │  │ get_relevant_tables     │
-│ search_  │  │ list_tables    │  │ execute_sql             │
-│ knowledge│  │ get_table_     │  │ analytics-spec (MAF)    │
-│ _base    │  │ _details       │  │                         │
-│ parallel │  │ search_tables  │  └──────────┬──────────────┘
-│ _search  │  │ metadata-mapping│             │
-└────┬─────┘  └───────┬────────┘             │
-     │                │                      │
-     ▼                ▼                      ▼
-┌────────────────┐  ┌──────────────────────────────────────────┐
-│ Azure AI Search│  │  Azure Databricks Unity Catalog           │
-│ index-dev-     │  │  (SQL Warehouse via JDBC)                │
-│ figure-01-chunk│  │  Catalog: configurable                   │
-│ Hybrid + Semantic│  │  Schemas: configurable (e.g. silver,gold)│
-│ + Agentic mode │  └──────────────────────────────────────────┘
-└────────┬───────┘
-         │
-         ▼
+└──────────────────────────────┬───────────────────────────────────┘
+                                     │
+                                     ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Specialized agents                                               │
+│ SearchAgent │ OntologyAgent │ MetadataAgent │ DataInsightAgent    │
+│ Azure Search│ Owlready2     │ Unity Catalog │ Databricks SQL      │
+│                                                                  │
+│ Analytics: OntologyAgent? → MetadataAgent → DataInsight          │
+│ Ontology failure: visible fallback → MetadataAgent → DataInsight │
+└──────────────────────────────┬───────────────────────────────────┘
+                                     │
+            ┌────────────────────┼──────────────────────┐
+            ▼                    ▼                      ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
+│ Azure AI Search  │  │ Ontology/**/*.owl│  │ Databricks Unity     │
+│ hybrid/semantic  │  │ read-only local  │  │ Catalog + SQL        │
+└──────────────────┘  └──────────────────┘  └──────────────────────┘
+                                     │
+                                     ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                      Azure Services                              │
 │  ┌───────────────────┐  ┌───────────────────────────────────┐   │
 │  │ Azure OpenAI      │  │  Azure Blob Storage               │   │
-│  │ GPT-5.1 (LLM)    │  │  Document URL resolution + SAS    │   │
+│  │ Azure OpenAI     │  │  Document URL resolution + SAS    │   │
 │  │ text-embedding-   │  │  Image URL resolution + SAS       │   │
 │  │   3-large (3072d) │  └───────────────────────────────────┘   │
 │  └───────────────────┘  ┌───────────────────────────────────┐   │
@@ -79,6 +75,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 - "Thinking" step panel showing live agent reasoning
 - Inline citation footnotes `[1]`, `[2]` with optional hyperlinks
 - Per-session conversation threads via `/threads/new` REST call
+- Per-session Ontology switch initialized from the backend environment default
 
 **Secondary UI** — Streamlit (`app.py`)
 - Standalone single-page app, requires no Node.js
@@ -97,6 +94,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `GET` | `/threads/{id}/history` | Message history for a thread |
 | `DELETE` | `/threads/{id}` | Delete a thread |
 | `GET` | `/skills` | List registered skills |
+| `GET` | `/config` | Non-sensitive runtime defaults and ontology capability status |
 | `GET` | `/health` | Health check |
 
 **SSE event types** streamed to frontend:
@@ -120,12 +118,13 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 
 **Session isolation and concurrency**:
 - Frontend messages, loading state, and `AbortController` are keyed by `thread_id`; switching sessions never redirects an in-flight stream into another session.
+- Ontology mode is keyed by `thread_id` in the frontend and captured in each chat request; one session cannot change another session's workflow.
 - Backend `active_runs` permits one active task per thread while different MAF `AgentSession` objects execute concurrently.
 - `POST /threads/{thread_id}/stop` cancels only that thread's MAF run and signals cooperative cancellation to delegated-agent worker waits.
 
 **Memory and cache**:
 - MAF `AgentSession` retains conversation history for contextual follow-up questions within one thread. A new thread starts with a separate history and memory state.
-- The application also keeps a process-local, thread-scoped exact response cache. A normalized repeated question within `SESSION_RESPONSE_CACHE_TTL_SECONDS` returns the completed answer without calling Azure OpenAI, Azure AI Search, or Databricks.
+- The application also keeps a process-local, thread-scoped exact response cache. A normalized repeated question within `SESSION_RESPONSE_CACHE_TTL_SECONDS` returns the completed answer only when its ontology mode also matches.
 - Cache entries never cross thread boundaries and are cleared when the backend process restarts or the thread is deleted.
 
 ### 3. MasterAgent (`src/agents/master_agent.py`)
@@ -145,7 +144,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `search_multiple_queries` | Executes a list of sub-queries via SearchAgent in parallel |
 | `search_knowledge` | Executes a single search and pushes citation refs to the SSE stream |
 | `delegate_metadata` | Streams a Unity Catalog schema question to MetadataAgent |
-| `delegate_data_analysis` | Deterministically runs MetadataAgent, then immediately streams DataInsightAgent with the returned schema context |
+| `delegate_data_analysis` | Runs progressive Skill routing first in enabled mode; governed analytics can skip Metadata, while non-Skill requests use property-first Ontology → physical Metadata verification → DataInsight |
 
 **Input routing logic**: MasterAgent uses `MASTER_AGENT_PROMPT` to decide which tool to call. Questions requiring data analytics or schema discovery are delegated; knowledge questions flow through `search_knowledge` / `search_multiple_queries`. Databricks Skills are advertised only inside their assigned sub-agents.
 
@@ -171,7 +170,19 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 - Timestamps: `timestamp`, `publish_date`
 - Image mapping: `image_mapping` (resolved to Azure Blob URLs with SAS token)
 
-### 5. DataInsightAgent (`src/agents/data_insight_agent.py`)
+### 5. OntologyAgent (`src/agents/ontology_agent.py`)
+
+**Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. Optional reasoning is disabled by default for the current OWL because HermiT rejects `xsd:date`.
+
+**Tools**: `search_entities`, `describe_entity`, `expand_neighbors`, `find_paths`, `find_related_by_type`, `get_schema_mapping`, `get_join_paths`, `get_lineage`, `get_semantic_candidates`, and `get_business_context`.
+
+Entity resolution combines exact IRI/name, multilingual labels, normalized tokens, type constraints, and fuzzy candidates. Query tools return stable JSON envelopes with evidence, confidence, attempted strategies, warnings, and unresolved concepts. Physical joins remain empty unless an OWL annotation explicitly grounds them.
+
+`OntologyService` is deliberately analysis-neutral. It returns role-neutral OWL properties with labels, comments, domains/ranges, class hierarchy and restrictions, plus ordered semantic relationships and paths. It does not select measures or dimensions and does not define baselines, decompositions, or SQL formulas. Business aliases belong in the OWL rather than Python lookup dictionaries.
+
+HermiT may reject ontology datatypes outside its OWL 2 datatype map. A reasoner failure is exposed as capability status while asserted OWL facts remain queryable. If OntologyAgent still cannot produce usable context for a request, MasterAgent emits a visible fallback activity and continues with the ordinary metadata-driven workflow.
+
+### 6. DataInsightAgent (`src/agents/data_insight_agent.py`)
 
 **Backend**: Azure Databricks Unity Catalog via JDBC (databricks-sql-connector)
 
@@ -179,13 +190,14 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 
 | Tool | Description |
 |------|-------------|
-| `get_relevant_tables` | Lists tables in the Unity Catalog schema matching a topic |
 | `execute_sql` | Runs a SQL query against the Databricks SQL Warehouse; returns rows as JSON |
-| Native Skill | `SkillsProvider` advertises and loads `analytics-spec` on demand |
+| `recover_metadata_context` | Exceptional, once-per-request MetadataAgent recovery when the schema handoff is missing or incomplete |
+| `recover_ontology_context` | Exceptional, once-per-request OntologyAgent recovery when ontology was enabled but context is unexpectedly missing |
+| Native Skills | `SkillsProvider` advertises governed templates plus `ontology-sql-planning` on demand |
 
 **Configuration**: `DatabricksConfig` — `HOST`, `TOKEN`, `HTTP_PATH`, `CATALOG`, `SCHEMAS` (comma-separated list), `MAX_ROWS`, `QUERY_TIMEOUT`. The agent is only instantiated when `DatabricksConfig.is_configured()` returns `True`.
 
-### 6. MetadataAgent (`src/agents/metadata_agent.py`)
+### 7. MetadataAgent (`src/agents/metadata_agent.py`)
 
 **Backend**: Azure Databricks Unity Catalog via JDBC
 
@@ -199,9 +211,13 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 | `search_tables` | Fuzzy-matches table names by keyword |
 | Native Skill | `SkillsProvider` advertises and loads `metadata-mapping` on demand |
 
-### 7. Skill System
+MetadataAgent remains necessary after adding OntologyAgent: ontology semantics identify business concepts and paths first, while Unity Catalog is the authority for executable table names, columns, keys, join cardinality, and availability. MasterAgent owns the canonical Ontology artifact and passes it directly to DataInsightAgent; MetadataAgent receives a bounded verification projection and cannot replace or discard the semantic context.
 
-**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. DataInsightAgent receives `analytics-spec`; MetadataAgent receives `metadata-mapping`; MasterAgent and SearchAgent do not receive Databricks Skills.
+For analytics, MetadataAgent retains its native MAF model/tool loop. The model searches or lists candidate tables from the current question, then retrieves details only for selected tables. Process-local TTL caches are keyed by catalog, schema table-list, and fully-qualified table detail; they avoid repeated network reads of the same UC object without bypassing the agent loop. DataInsightAgent receives the agent summary plus every raw tool result from that run. The normal path never repeats MetadataAgent; a bounded recovery tool is available only when the DataInsight LLM identifies a concrete missing or incomplete handoff.
+
+### 8. Skill System
+
+**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. OntologyAgent receives governed template routing Skills; DataInsightAgent receives those governed Skills plus `ontology-sql-planning`; Metadata discovery receives `metadata-mapping`; Metadata verification, MasterAgent, and SearchAgent receive no data Skills.
 
 MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on demand, then optionally read resources or execute approval-gated scripts.
 
@@ -209,10 +225,11 @@ MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on
 
 | Skill | Purpose |
 |-------|---------|
-| `analytics-spec` | Data analytics query patterns and conventions |
+| `analytics-spec` | Governed highest-spending-customer SQL template and matching contract |
+| `ontology-sql-planning` | Dynamic planning and SQL engineering method for every non-governed query; uses OWL when available and verified UC in all modes |
 | `metadata-mapping` | Unity Catalog metadata field mapping rules |
 
-### 8. AzureAISearchTool (`src/tools/ai_search_tool.py`)
+### 9. AzureAISearchTool (`src/tools/ai_search_tool.py`)
 
 - `search()`: Main async search entrypoint — dispatches to `_search_standard` or `_search_with_agentic_mode`
 - `_search_standard`: Builds `VectorizedQuery` + `SearchOptions`; supports hybrid + semantic reranking
@@ -265,13 +282,20 @@ User Question (analytics intent detected)
       ↓
 MasterAgent → delegate_data_analysis()
       ↓
-MetadataAgent resolves UC schema and returns schema_context
+Ontology enabled for this session?
+  ├── No  → MetadataAgent resolves question-relevant UC objects
+      └── Yes → OntologyAgent resolves role-neutral properties, restrictions, semantic paths, and lineage
+              ├── success → MetadataAgent verifies the ontology-derived physical candidates
+              └── failure → emit visible fallback, then run ordinary MetadataAgent lookup
+      └── get_table_details runs only for selected candidates; object cache may serve it
       ↓
-DataInsightAgent receives schema_context, loads matching Skills, and executes SQL
+DataInsightAgent receives canonical ontology evidence (when available) plus independent authoritative schema context and reconciles both before SQL
       ↓
 DataInsightAgent.query_stream()
-  ├── load_skill("analytics-spec")  → injects query conventions
-  ├── get_relevant_tables(topic)    → Unity Catalog table list
+      ├── governed route → load template Skill + indexed SQL resource
+      ├── ordinary ontology route → load_skill("ontology-sql-planning")
+      │      └── primary model dynamically selects metric, grain, comparisons, and SQL
+      ├── recover_* only if an expected context handoff is missing/incomplete
   ├── execute_sql(sql)              → Databricks SQL Warehouse
   └── Stream results back
       ↓
@@ -306,10 +330,16 @@ DatabricksConfig
   ├── MAX_ROWS, QUERY_TIMEOUT
   └── is_configured() → bool
 
+OntologyConfig
+      ├── DIRECTORY, FILE_GLOB, ONLY_LOCAL
+      ├── ENABLE_REASONER, REASONER
+      └── MAX_RESULTS, MAX_DEPTH, MAX_PATHS, MAX_NODES, FUZZY_THRESHOLD, AGENT_TIMEOUT_SECONDS
+
 AppConfig
   ├── LOG_LEVEL, MAX_SEARCH_RESULTS, DEFAULT_TOP_K
   ├── DEFAULT_ENABLE_SEMANTIC_RERANKER
   ├── DEFAULT_ENABLE_AGENTIC_RETRIEVAL
+      ├── DEFAULT_ENABLE_ONTOLOGY
   └── LOG_DIR, TMP_DIR, DATA_DIR
 ```
 

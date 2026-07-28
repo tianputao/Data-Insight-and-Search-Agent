@@ -12,7 +12,7 @@ Additionally, the standalone **Streamlit UI** (`app.py`) can be deployed indepen
 ## 📋 Pre-Deployment Checklist
 
 ### Azure Resources
-- [ ] Azure OpenAI resource with GPT-5.1 deployment
+- [ ] Azure OpenAI resource with primary and small tool-capable GPT deployments
 - [ ] text-embedding-3-large deployment (3072 dimensions)
 - [ ] Azure AI Search service with semantic search + vector search configured
 - [ ] Search index (`index-dev-figure-01-chunk` schema or equivalent) loaded with data
@@ -69,7 +69,8 @@ az webapp config appsettings set \
   --settings \
     AZURE_OPENAI_ENDPOINT="<value>" \
     AZURE_OPENAI_AUTH_MODE="aad" \
-    AZURE_OPENAI_GPT_DEPLOYMENT="gpt-5.1" \
+    AZURE_OPENAI_GPT_DEPLOYMENT="<primary-deployment>" \
+    AZURE_OPENAI_GPT_SMALL_DEPLOYMENT="<small-deployment>" \
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT="text-embedding-3-large" \
     AZURE_OPENAI_EMBEDDING_DIMENSIONS="3072" \
     AZURE_SEARCH_ENDPOINT="<value>" \
@@ -374,7 +375,7 @@ Use App Service deployment slots or separate resources per environment:
 ## 📝 Post-Deployment Tasks
 
 1. **Verify functionality**: Test each question type (RAG, data insight, metadata)
-2. **Check skill loading**: `GET /skills` returns both `analytics-spec` and `metadata-mapping`
+2. **Check skill loading**: `GET /skills` returns `analytics-spec`, `ontology-sql-planning`, and `metadata-mapping`
 3. **Monitor logs**: `az webapp log tail --resource-group <your-rg> --name <your-app-name>`
 4. **Set up Azure Monitor alerts**
 5. **Document internal service endpoints** for the team

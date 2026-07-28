@@ -45,7 +45,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
-from src.agents import MasterAgent, SearchAgent, DataInsightAgent, MetadataAgent
+from src.agents import (
+    DataInsightAgent,
+    MasterAgent,
+    MetadataAgent,
+    OntologyAgent,
+    SearchAgent,
+)
+from src.ontology import OntologyService
 from src.tools import AzureAISearchTool
 from src.config import AppConfig, AzureSearchConfig, DatabricksConfig
 from src.utils import get_logger
@@ -73,6 +80,8 @@ class AppState:
     """Holds singletons shared across all requests."""
 
     master_agent: Optional[MasterAgent] = None
+    ontology_service: Optional[OntologyService] = None
+    ontology_error: Optional[str] = None
     # thread_id (str) → MAF thread object
     threads: Dict[str, object] = {}
     # thread_id → list of {"user": str, "assistant": str, "timestamp": str}
@@ -108,13 +117,32 @@ async def lifespan(app: FastAPI):
         metadata_agent = MetadataAgent()
         logger.info("MetadataAgent initialised.")
 
-        data_insight_agent = DataInsightAgent(metadata_agent=metadata_agent)
+        ontology_agent: Optional[OntologyAgent] = None
+        try:
+            state.ontology_service = OntologyService().load()
+            ontology_agent = OntologyAgent(state.ontology_service)
+            state.ontology_error = state.ontology_service.reasoning_error
+            logger.info("OntologyAgent initialised.")
+        except Exception as ontology_exc:
+            state.ontology_service = None
+            state.ontology_error = str(ontology_exc)
+            logger.error(
+                "Ontology capability initialisation failed: %s",
+                ontology_exc,
+                exc_info=True,
+            )
+
+        data_insight_agent = DataInsightAgent(
+            metadata_agent=metadata_agent,
+            ontology_agent=ontology_agent,
+        )
         logger.info("DataInsightAgent initialised.")
 
         state.master_agent = MasterAgent(
             search_agent=search_agent,
             data_insight_agent=data_insight_agent,
             metadata_agent=metadata_agent,
+            ontology_agent=ontology_agent,
         )
         state.initialized = True
         logger.info("MasterAgent initialised successfully.")
@@ -128,6 +156,8 @@ async def lifespan(app: FastAPI):
 
     yield  # Server is running
 
+    if state.ontology_service is not None:
+        state.ontology_service.close()
     logger.info("FastAPI server shutting down.")
 
 
@@ -155,6 +185,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str
     thread_id: Optional[str] = None
+    enable_ontology: Optional[bool] = None
 
 
 class NewThreadRequest(BaseModel):
@@ -180,7 +211,11 @@ def _normalize_cache_question(question: str) -> str:
     return " ".join(normalized.split())
 
 
-def _find_cached_response(thread_id: str, question: str) -> Optional[str]:
+def _find_cached_response(
+    thread_id: str,
+    question: str,
+    enable_ontology: bool = AppConfig.DEFAULT_ENABLE_ONTOLOGY,
+) -> Optional[str]:
     """Return the latest completed answer for the same question in this thread only."""
     if not AppConfig.SESSION_RESPONSE_CACHE_ENABLED:
         return None
@@ -199,15 +234,53 @@ def _find_cached_response(thread_id: str, question: str) -> Optional[str]:
         if (
             _normalize_cache_question(str(turn.get("user") or "")) == cache_key
             and str(turn.get("assistant") or "").strip()
+            and turn.get("enable_ontology") is enable_ontology
         ):
             return str(turn["assistant"])
     return None
+
+
+def _public_ontology_health() -> Dict[str, Any]:
+    """Return non-sensitive ontology status with a concise error summary."""
+    raw = (
+        state.ontology_service.health()
+        if state.ontology_service is not None
+        else {
+            "available": False,
+            "reasoner_enabled": False,
+            "reasoner": "unavailable",
+            "reasoning_status": "unavailable",
+            "reasoning_error": state.ontology_error,
+            "file_count": 0,
+            "ontology_count": 0,
+            "entity_count": 0,
+        }
+    )
+    raw_error = str(raw.get("reasoning_error") or "")
+    error_lines = [
+        line.strip()
+        for line in raw_error.splitlines()
+        if line.strip()
+        and line.strip() != "Java error message is:"
+        and not line.lstrip().startswith("at ")
+    ]
+    return {
+        "available": bool(raw.get("available")),
+        "reasoner_enabled": bool(raw.get("reasoner_enabled")),
+        "reasoner": raw.get("reasoner"),
+        "reasoning_status": raw.get("reasoning_status"),
+        "reasoning_error": error_lines[0][:500] if error_lines else None,
+        "file_count": int(raw.get("file_count") or 0),
+        "ontology_count": int(raw.get("ontology_count") or 0),
+        "entity_count": int(raw.get("entity_count") or 0),
+    }
 
 
 async def _cached_response_stream(
     message: str,
     thread_id: str,
     cached_response: str,
+    enable_ontology: bool,
 ) -> AsyncGenerator[str, None]:
     """Serve a session-memory hit without invoking MAF or external services."""
     yield _sse(
@@ -219,12 +292,18 @@ async def _cached_response_stream(
             "state": "completed",
             "agent": "MasterAgent",
             "message": "Reused answer from this session",
-            "summary": "Exact normalized question matched a completed turn",
-            "metrics": {"cache_hit": True},
+            "summary": "Exact normalized question and ontology mode matched a completed turn",
+            "metrics": {"cache_hit": True, "enable_ontology": enable_ontology},
         }
     )
     yield _sse({"type": "text", "content": cached_response})
-    _append_history(thread_id, message, cached_response, cache_hit=True)
+    _append_history(
+        thread_id,
+        message,
+        cached_response,
+        cache_hit=True,
+        enable_ontology=enable_ontology,
+    )
     yield _sse({"type": "thinking_done"})
     yield _sse({"type": "done", "content": cached_response, "cache_hit": True})
 
@@ -233,10 +312,9 @@ def _ensure_blob_sas_url(url: str, is_image: bool = False) -> str:
     """Ensure a blob storage URL carries SAS params for private storage accounts.
 
     IMPORTANT: The SAS token is appended as a raw query string rather than being
-    decoded through parse_qsl / urlencode.  The round-trip decode-then-encode can
+    decoded through parse_qsl / urlencode. The round-trip decode-then-encode can
     silently corrupt the 'sig' field because urllib.parse.parse_qsl treats '+' as
-    a space (HTML form-data convention), which changes the base64 signature and
-    causes Azure to return AuthenticationFailed / 'Signature not well formed'.
+    a space (HTML form-data convention), which changes the base64 signature.
     """
     if not url or "blob.core.windows.net" not in url:
         return url
@@ -690,6 +768,7 @@ async def _stream_agent_response(
     thread,
     thread_id: str,
     active_run: ActiveRun,
+    enable_ontology: bool = AppConfig.DEFAULT_ENABLE_ONTOLOGY,
 ) -> AsyncGenerator[str, None]:
     """
     Run MasterAgent.chat_stream and convert MAF update objects to SSE events.
@@ -715,6 +794,7 @@ async def _stream_agent_response(
             thread=thread,
             stream_context=(combined, main_loop),
             cancel_event=active_run.cancel_event,
+            enable_ontology=enable_ontology,
         )
         try:
             async for upd in stream:
@@ -966,7 +1046,12 @@ async def _stream_agent_response(
     # Ensure every blob URL in the final answer is signed, regardless of how the LLM formats it.
     full_response = _patch_blob_urls_with_sas(full_response)
 
-    _append_history(thread_id, message, full_response)
+    _append_history(
+        thread_id,
+        message,
+        full_response,
+        enable_ontology=enable_ontology,
+    )
 
     yield _sse({"type": "thinking_done"})
     yield _sse({"type": "done", "content": full_response})
@@ -998,6 +1083,7 @@ def _append_history(
     assistant_msg: str,
     *,
     cache_hit: bool = False,
+    enable_ontology: bool,
 ) -> None:
     """Store a completed turn in the thread history."""
     if thread_id not in state.thread_history:
@@ -1008,6 +1094,7 @@ def _append_history(
             "assistant": assistant_msg,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "cache_hit": cache_hit,
+            "enable_ontology": enable_ontology,
         }
     )
 
@@ -1022,7 +1109,17 @@ async def health_check():
         "agent_initialized": state.initialized,
         "init_error": state.init_error,
         "active_threads": len(state.threads),
+        "ontology": _public_ontology_health(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/config")
+async def get_runtime_config():
+    """Return non-sensitive runtime defaults and optional capability status."""
+    return {
+        "default_enable_ontology": AppConfig.DEFAULT_ENABLE_ONTOLOGY,
+        "ontology": _public_ontology_health(),
     }
 
 
@@ -1081,6 +1178,11 @@ async def chat_stream(request: ChatRequest):
         return StreamingResponse(_error_stream(), media_type="text/event-stream")
 
     thread_id, thread = _get_or_create_thread(request.thread_id)
+    enable_ontology = (
+        AppConfig.DEFAULT_ENABLE_ONTOLOGY
+        if request.enable_ontology is None
+        else request.enable_ontology
+    )
 
     existing_run = state.active_runs.get(thread_id)
     if existing_run is not None:
@@ -1091,10 +1193,19 @@ async def chat_stream(request: ChatRequest):
             )
         state.active_runs.pop(thread_id, None)
 
-    cached_response = _find_cached_response(thread_id, request.message)
+    cached_response = _find_cached_response(
+        thread_id,
+        request.message,
+        enable_ontology,
+    )
     if cached_response is not None:
         return StreamingResponse(
-            _cached_response_stream(request.message, thread_id, cached_response),
+            _cached_response_stream(
+                request.message,
+                thread_id,
+                cached_response,
+                enable_ontology,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1110,7 +1221,13 @@ async def chat_stream(request: ChatRequest):
     state.active_runs[thread_id] = active_run
 
     return StreamingResponse(
-        _stream_agent_response(request.message, thread, thread_id, active_run),
+        _stream_agent_response(
+            request.message,
+            thread,
+            thread_id,
+            active_run,
+            enable_ontology,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

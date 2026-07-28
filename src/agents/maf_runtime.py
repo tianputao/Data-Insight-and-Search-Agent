@@ -19,16 +19,29 @@ from azure.identity import DefaultAzureCredential
 from ..config import AppConfig, AzureOpenAIConfig
 
 
-def create_chat_client() -> OpenAIChatCompletionClient:
+def create_chat_client(
+    *,
+    model: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    max_function_calls: Optional[int] = None,
+) -> OpenAIChatCompletionClient:
     """Create the MAF OpenAI provider configured for Azure OpenAI."""
     common: dict[str, Any] = {
-        "model": AzureOpenAIConfig.GPT_DEPLOYMENT,
+        "model": model or AzureOpenAIConfig.GPT_DEPLOYMENT,
         "azure_endpoint": AzureOpenAIConfig.ENDPOINT,
         "api_version": AzureOpenAIConfig.API_VERSION,
         "function_invocation_configuration": {
             "enabled": True,
-            "max_iterations": AppConfig.QUERY_ENGINE_MAX_MODEL_ROUNDTRIPS,
-            "max_function_calls": AppConfig.QUERY_ENGINE_MAX_FUNCTION_CALLS,
+            "max_iterations": (
+                max_iterations
+                if max_iterations is not None
+                else AppConfig.QUERY_ENGINE_MAX_MODEL_ROUNDTRIPS
+            ),
+            "max_function_calls": (
+                max_function_calls
+                if max_function_calls is not None
+                else AppConfig.QUERY_ENGINE_MAX_FUNCTION_CALLS
+            ),
             "max_consecutive_errors_per_request": (
                 AppConfig.QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS
             ),
@@ -48,14 +61,25 @@ def create_agent(
     tools: Sequence[Any],
     temperature: float,
     context_providers: Optional[Sequence[ContextProvider]] = None,
+    model: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    max_function_calls: Optional[int] = None,
 ) -> Agent:
     """Create a MAF Agent while keeping construction consistent across sub-agents."""
-    return create_chat_client().as_agent(
+    selected_model = model or AzureOpenAIConfig.GPT_DEPLOYMENT
+    default_options: dict[str, Any] = {}
+    if not selected_model.strip().lower().startswith("gpt-5"):
+        default_options["temperature"] = temperature
+    return create_chat_client(
+        model=selected_model,
+        max_iterations=max_iterations,
+        max_function_calls=max_function_calls,
+    ).as_agent(
         name=name,
         instructions=instructions,
         tools=list(tools),
         context_providers=list(context_providers or []),
-        default_options={"temperature": temperature},
+        default_options=default_options,
     )
 
 

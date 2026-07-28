@@ -10,21 +10,23 @@
 
 ## 🎯 What You Have
 
-### 🤖 Multi-Agent System (4 Agents)
+### 🤖 Multi-Agent System (5 Agents)
 
 | Agent | Purpose | Key Tools |
 |-------|---------|-----------|
 | **MasterAgent** | Orchestration and routing | `decompose_query`, `search_multiple_queries`, `search_knowledge`, `delegate_metadata`, `delegate_data_analysis` |
 | **SearchAgent** | Azure AI Search hybrid retrieval | `search_knowledge_base`, `parallel_search` |
-| **DataInsightAgent** | Databricks Unity Catalog SQL analytics | `get_relevant_tables`, `execute_sql`, `load_skill` |
+| **OntologyAgent** | Read-only OWL business semantics and multi-hop paths | `search_entities`, `describe_entity`, `find_paths`, `get_join_paths`, `get_business_context`, and related Owlready2 tools |
+| **DataInsightAgent** | Databricks Unity Catalog SQL analytics | `execute_sql`; bounded context recovery; governed template Skills plus native `ontology-sql-planning` |
 | **MetadataAgent** | Unity Catalog schema browsing | `list_schemas`, `list_tables`, `get_table_details`, `search_tables`; native `metadata-mapping` Skill |
 
-All agents are powered by Azure OpenAI GPT-5.1 via Microsoft Agent Framework 1.11 and `OpenAIChatCompletionClient`.
+Agents use Azure OpenAI through Microsoft Agent Framework 1.11 and `OpenAIChatCompletionClient`: Master/DataInsight use the primary deployment, while Ontology/Metadata use the configured small deployment.
 
 ### 🔌 Skill System
 
 Plugin-based skills in `skills/`:
 - **`analytics-spec`** — data analytics query conventions
+- **`ontology-sql-planning`** — dynamic OWL + verified UC query-planning method
 - **`metadata-mapping`** — Unity Catalog metadata field mapping
 
 MAF `SkillsProvider` discovers `SKILL.md` files, advertises only the Skills assigned to each agent, and registers native load/resource/script tools. Read-only loading is trusted; script execution remains approval-gated.
@@ -33,7 +35,7 @@ MAF `SkillsProvider` discovers `SKILL.md` files, advertises only the Skills assi
 
 | Mode | Command | Port | Notes |
 |------|---------|------|-------|
-| Full Stack (React) | `./run.sh` | 3000 (UI) + 8000 (API) | Streaming SSE, all 4 agents |
+| Full Stack (React) | `./run.sh` | 3000 (UI) + 8000 (API) | Streaming SSE, all 5 agents |
 | Backend only | `./run.sh backend` | 8000 | FastAPI |
 | Frontend only | `./run.sh frontend` | 3000 | React dev server |
 | Streamlit | `./run.sh streamlit` | 8501 | RAG only, no Databricks agents |
@@ -45,9 +47,11 @@ src/
 ├── agents/
 │   ├── master_agent.py       # Orchestration (5 tools)
 │   ├── search_agent.py       # Azure AI Search (2 tools)
-│   ├── data_insight_agent.py # Databricks SQL + analytics-spec provider
+│   ├── data_insight_agent.py # Databricks SQL + governed/dynamic Skill provider
 │   ├── metadata_agent.py     # Unity Catalog + metadata-mapping provider
+│   ├── ontology_agent.py     # Owlready2 business context tools
 │   └── maf_runtime.py        # MAF client/session/stream adapter
+├── ontology/service.py       # Recursive read-only OWL loading and graph queries
 ├── api/main.py               # FastAPI backend + SSE streaming + citation pipeline
 ├── config/settings.py        # All config classes (OpenAI, Search, Databricks, App)
 ├── skills_provider.py        # Native MAF SkillsProvider factory/API adapter
@@ -57,12 +61,14 @@ skills/
 ├── analytics-spec/
 │   ├── SKILL.md
 │   └── references/highest-spending-customer.sql
+├── ontology-sql-planning/SKILL.md
 └── metadata-mapping/SKILL.md
 frontend/src/
 ├── App.tsx                   # Chat UI + citation normalization
 ├── services/api.ts           # SSE client
 └── types/index.ts
 app.py                        # Standalone Streamlit UI (RAG only)
+Ontology/*.owl                # Read-only business ontologies
 run.sh                        # Launcher script
 ```
 
@@ -74,6 +80,8 @@ run.sh                        # Launcher script
 - ✅ **Rich index schema** — 30+ field mappings covering document metadata, language, header hierarchy, image mapping
 - ✅ **Blob Storage SAS** — document and image URLs auto-resolved with SAS tokens
 - ✅ **Optional Databricks** — DataInsight and Metadata agents gracefully absent when not configured
+- ✅ **Ontology-guided SQL** — session-selectable role-neutral OWL properties, restrictions, lineage, and semantic paths before UC verification and model-driven planning
+- ✅ **Visible fallback** — Ontology failures are shown in the thinking panel before standard metadata-driven analysis continues
 - ✅ **Comprehensive logging** — `logs/application_YYYYMMDD.log`
 
 ---
@@ -97,7 +105,8 @@ Minimum required:
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_AUTH_MODE=aad          # or: key (if key-based auth is enabled)
 AZURE_OPENAI_API_KEY=               # required only when AUTH_MODE=key
-AZURE_OPENAI_GPT_DEPLOYMENT=gpt-5.1
+AZURE_OPENAI_GPT_DEPLOYMENT=<primary-deployment>
+AZURE_OPENAI_GPT_SMALL_DEPLOYMENT=<small-tool-capable-deployment>
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
 AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
 AZURE_SEARCH_API_KEY=your-search-key
@@ -129,6 +138,9 @@ AZURE_SEARCH_INDEX_NAME=your-index-name
 |----------|---------|--------|
 | `DEFAULT_ENABLE_SEMANTIC_RERANKER` | `true` | Azure AI Search semantic reranking |
 | `DEFAULT_ENABLE_AGENTIC_RETRIEVAL` | `true` | Azure-managed agentic retrieval |
+| `DEFAULT_ENABLE_ONTOLOGY` | `true` | Initial Ontology switch value for each new session |
+
+The React Ontology switch belongs to the active session. Switching it does not affect other sessions or already-running requests.
 
 ### Databricks (Optional)
 
@@ -138,7 +150,7 @@ DATABRICKS_HOST=https://adb-XXXX.XX.azuredatabricks.net/
 DATABRICKS_TOKEN=dapiXXXXXXXXXXXXXXXX
 DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
 DATABRICKS_CATALOG=<catalog-name>
-DATABRICKS_SCHEMAS=silver,gold
+DATABRICKS_SCHEMAS=silver  # Add comma-separated schemas only when they actually exist
 ```
 
 ---
@@ -150,14 +162,20 @@ DATABRICKS_SCHEMAS=silver,gold
 ```
 User Question
        ↓
-MasterAgent (GPT-5.1, main AgentSession + bounded agentic loop)
+MasterAgent (primary GPT deployment, main AgentSession + bounded agentic loop)
        ↓
   Correct and enrich search terminology
          ↓
   Simple?  → search_knowledge        → SearchAgent → Azure AI Search
   Complex? → decompose_query
               → search_multiple_queries (parallel) → SearchAgent
-       Data?    → delegate_data_analysis  → MetadataAgent → DataInsightAgent → Databricks SQL
+         Data?    → delegate_data_analysis
+                            Ontology on? → OntologyAgent progressively matches governed Skills
+                                   match → DataInsightAgent loads Skill + governed SQL resource
+                                   no match → role-neutral OWL → Metadata verifier
+                                            → DataInsightAgent loads ontology-sql-planning
+                            Ontology off/fallback? → MetadataAgent loads metadata-mapping → DataInsightAgent
+                    → Databricks SQL
   Schema?  → delegate_metadata       → MetadataAgent   → Unity Catalog
        ↓
 Collect search refs  →  push "refs" SSE event

@@ -32,6 +32,7 @@ class QueryEngineContext:
 
     original_question: str
     max_search_attempts: int
+    enable_ontology: bool = True
     stream_context: Any = None
     cancel_event: Optional[Event] = None
     tool_outcomes: list[ToolOutcome] = field(default_factory=list)
