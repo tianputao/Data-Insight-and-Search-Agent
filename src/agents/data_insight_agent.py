@@ -305,6 +305,7 @@ class DataInsightAgent:
         ontology_fallback: str,
         ontology_enabled: bool,
         governed_skill_context: str = "",
+        business_layer: str = "",
     ) -> tuple[_RecoveryState, str]:
         state = _RecoveryState(
             question=self._original_question(question),
@@ -343,6 +344,10 @@ class DataInsightAgent:
         if ontology_context:
             context_blocks.append(
                 f"<ontology_context>\n{ontology_context}\n</ontology_context>"
+            )
+        if business_layer:
+            context_blocks.append(
+                f"<business_layer_context>\n{business_layer}\n</business_layer_context>"
             )
         if schema_context:
             context_blocks.append(
@@ -755,6 +760,7 @@ class DataInsightAgent:
         ontology_fallback: str = "",
         ontology_enabled: bool = False,
         governed_skill_context: str = "",
+        business_layer: str = "",
     ) -> str:
         """
         Ask a data-related question.  The agent generates SQL, executes it, and
@@ -777,6 +783,7 @@ class DataInsightAgent:
             ontology_fallback=ontology_fallback,
             ontology_enabled=ontology_enabled,
             governed_skill_context=governed_skill_context,
+            business_layer=business_layer,
         )
         token = self._recovery_state.set(state)
         skill_token = begin_skill_usage_tracking()
@@ -797,6 +804,7 @@ class DataInsightAgent:
         ontology_fallback: str = "",
         ontology_enabled: bool = False,
         governed_skill_context: str = "",
+        business_layer: str = "",
     ):
         """
         Streaming version of :meth:`query`.  Yields MAF update objects.
@@ -810,6 +818,7 @@ class DataInsightAgent:
             ontology_fallback=ontology_fallback,
             ontology_enabled=ontology_enabled,
             governed_skill_context=governed_skill_context,
+            business_layer=business_layer,
         )
         token = self._recovery_state.set(state)
         skill_token = begin_skill_usage_tracking()

@@ -172,7 +172,7 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 
 ### 5. OntologyAgent (`src/agents/ontology_agent.py`)
 
-**Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. Optional reasoning is disabled by default for the current OWL because HermiT rejects `xsd:date`.
+**Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. HermiT reasoning is enabled by default and can be disabled via `ONTOLOGY_ENABLE_REASONER=false`.
 
 **Tools**: `search_entities`, `describe_entity`, `expand_neighbors`, `find_paths`, `find_related_by_type`, `get_schema_mapping`, `get_join_paths`, `get_lineage`, `get_semantic_candidates`, and `get_business_context`.
 

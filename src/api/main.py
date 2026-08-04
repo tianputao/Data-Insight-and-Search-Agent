@@ -8,6 +8,8 @@ POST  /threads/new          Create a new conversation thread
 GET   /threads              List all active threads
 GET   /threads/{id}/history Get message history for a thread
 DELETE /threads/{id}        Delete a thread
+GET   /business-layer       Read the workspace business semantic document
+PUT   /business-layer       Save the workspace business semantic document
 GET   /skills               List available skills
 GET   /health               Health check
 
@@ -55,6 +57,7 @@ from src.agents import (
 from src.ontology import OntologyService
 from src.tools import AzureAISearchTool
 from src.config import AppConfig, AzureSearchConfig, DatabricksConfig
+from src.business_layer import load_business_layer, save_business_layer
 from src.utils import get_logger
 from src.utils.activity import (
     delegated_agent,
@@ -190,6 +193,10 @@ class ChatRequest(BaseModel):
 
 class NewThreadRequest(BaseModel):
     thread_id: Optional[str] = None
+
+
+class BusinessLayerBody(BaseModel):
+    content: str
 
 
 class ThreadInfo(BaseModel):
@@ -769,6 +776,7 @@ async def _stream_agent_response(
     thread_id: str,
     active_run: ActiveRun,
     enable_ontology: bool = AppConfig.DEFAULT_ENABLE_ONTOLOGY,
+    business_layer: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Run MasterAgent.chat_stream and convert MAF update objects to SSE events.
@@ -795,6 +803,7 @@ async def _stream_agent_response(
             stream_context=(combined, main_loop),
             cancel_event=active_run.cancel_event,
             enable_ontology=enable_ontology,
+            business_layer=business_layer,
         )
         try:
             async for upd in stream:
@@ -1227,6 +1236,7 @@ async def chat_stream(request: ChatRequest):
             thread_id,
             active_run,
             enable_ontology,
+            load_business_layer(),
         ),
         media_type="text/event-stream",
         headers={
@@ -1304,6 +1314,19 @@ async def list_skills():
     if state.master_agent is None:
         return []
     return await list_skill_metadata(state.master_agent.agent)
+
+
+@app.get("/business-layer")
+async def get_business_layer():
+    """Return the workspace business semantic document."""
+    return {"content": load_business_layer()}
+
+
+@app.put("/business-layer")
+async def put_business_layer(body: BusinessLayerBody):
+    """Persist the workspace business semantic document."""
+    stored = save_business_layer(body.content)
+    return {"ok": True, "length": len(stored)}
 
 
 # ─── Dev entry-point ───────────────────────────────────────────────────────────

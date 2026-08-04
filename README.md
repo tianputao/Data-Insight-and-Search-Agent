@@ -31,7 +31,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Backend API**: FastAPI with Server-Sent Events (port 8000)
 - **Secondary Frontend**: Streamlit standalone app (`app.py`, port 8501) — RAG only
 - **Data Analytics**: Azure Databricks Unity Catalog (SQL Warehouse via JDBC)
-- **Ontology Runtime**: Owlready2 with read-only recursive OWL loading; optional HermiT reasoning is disabled by default because the current OWL uses unsupported `xsd:date`
+- **Ontology Runtime**: Owlready2 with read-only recursive OWL loading; HermiT reasoning is enabled by default
 - **Monitoring**: Azure AI Foundry
 - **Agent Skills**: Extend the agent’s capabilities using agent skills, enabling the agent to analyze and search data based on real-world business rules.
 - **Sub Agents**: Adopt a multi-agent architecture, using domain-specific agents to improve efficiency and isolate context.
@@ -124,8 +124,8 @@ Comprehensive_AI_Agent/
 │   │   └── main.py              # FastAPI server: SSE /chat/stream + REST endpoints
 │   ├── tools/
 │   │   └── ai_search_tool.py    # Azure AI Search: hybrid, semantic, agentic modes
-│   ├── prompts/
-│   │   └── system_prompts.py    # Agent system prompts (MASTER_AGENT_PROMPT, etc.)
+│   ├── prompts/                 # Per-agent system prompts:
+│   │   └── master.py · search.py · ontology.py · data_insight.py · metadata.py
 │   ├── config/
 │   │   └── settings.py          # AzureOpenAIConfig, AzureSearchConfig,
 │   │                            #   AzureAIFoundryConfig, DatabricksConfig, AppConfig

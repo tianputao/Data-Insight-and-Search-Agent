@@ -56,7 +56,7 @@ src/
 ├── config/settings.py        # All config classes (OpenAI, Search, Databricks, App)
 ├── skills_provider.py        # Native MAF SkillsProvider factory/API adapter
 ├── tools/ai_search_tool.py   # Azure AI Search: hybrid, semantic, agentic modes
-└── prompts/system_prompts.py # Agent system prompts
+└── prompts/                  # Per-agent system prompts (master, search, ontology, data_insight, metadata)
 skills/
 ├── analytics-spec/
 │   ├── SKILL.md

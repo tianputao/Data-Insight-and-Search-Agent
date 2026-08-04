@@ -105,6 +105,7 @@ class MasterAgent:
         stream_context: Any = None,
         cancel_event: Optional[Event] = None,
         enable_ontology: Optional[bool] = None,
+        business_layer: str = "",
     ) -> QueryEngineContext:
         return QueryEngineContext(
             original_question=message,
@@ -114,6 +115,7 @@ class MasterAgent:
                 if enable_ontology is None
                 else enable_ontology
             ),
+            business_layer=business_layer,
             stream_context=stream_context,
             cancel_event=cancel_event,
         )
@@ -1532,6 +1534,7 @@ Sub-questions:"""
                 if turn is not None
                 else (getattr(self, "_current_user_message", "") or "").strip()
             )
+            business_layer = turn.business_layer if turn is not None else ""
 
             def _run():
                 import asyncio as _asyncio
@@ -1553,6 +1556,7 @@ Sub-questions:"""
                                 ontology_fallback=ontology_fallback,
                                 ontology_enabled=ontology_enabled,
                                 governed_skill_context=governed_skill_context,
+                                business_layer=business_layer,
                             ),
                             agent="DataInsightAgent",
                             parent_id=agent_activity_id,
@@ -1886,6 +1890,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         message: str,
         thread=None,
         enable_ontology: Optional[bool] = None,
+        business_layer: str = "",
     ) -> Dict[str, Any]:
         """
         Process a user message and generate a response.
@@ -1898,7 +1903,11 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             Agent response with text and metadata
         """
         logger.info(f"MasterAgent.chat called with message: '{message}'")
-        turn = self._new_turn(message, enable_ontology=enable_ontology)
+        turn = self._new_turn(
+            message,
+            enable_ontology=enable_ontology,
+            business_layer=business_layer,
+        )
         context_var = self._turn_context_var()
         token = context_var.set(turn)
 
@@ -1921,6 +1930,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         stream_context: Any = None,
         cancel_event: Optional[Event] = None,
         enable_ontology: Optional[bool] = None,
+        business_layer: str = "",
     ):
         """
         Process a user message with streaming response.
@@ -1939,6 +1949,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             stream_context=stream_context,
             cancel_event=cancel_event,
             enable_ontology=enable_ontology,
+            business_layer=business_layer,
         )
         context_var = self._turn_context_var()
         token = context_var.set(turn)

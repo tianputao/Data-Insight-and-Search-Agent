@@ -273,6 +273,10 @@ function App() {
   const [defaultEnableOntology, setDefaultEnableOntology] = useState(true);
   const [sessionOntologyModes, setSessionOntologyModes] = useState<Map<string, boolean>>(new Map());
   const [loadingSessionIds, setLoadingSessionIds] = useState<Set<string>>(new Set());
+  const [businessLayerOpen, setBusinessLayerOpen] = useState(false);
+  const [businessLayerDraft, setBusinessLayerDraft] = useState('');
+  const [businessLayerStatus, setBusinessLayerStatus] = useState('');
+  const [businessLayerBusy, setBusinessLayerBusy] = useState(false);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const initialSessionRequestedRef = useRef(false);
@@ -290,6 +294,34 @@ function App() {
       next.set(sessionId, updater(next.get(sessionId) ?? []));
       return next;
     });
+  };
+
+  const openBusinessLayer = async () => {
+    setBusinessLayerOpen(true);
+    setBusinessLayerBusy(true);
+    setBusinessLayerStatus('Loading…');
+    try {
+      const { content } = await apiService.getBusinessLayer();
+      setBusinessLayerDraft(content);
+      setBusinessLayerStatus('');
+    } catch {
+      setBusinessLayerStatus('Could not load the document.');
+    } finally {
+      setBusinessLayerBusy(false);
+    }
+  };
+
+  const persistBusinessLayer = async () => {
+    setBusinessLayerBusy(true);
+    setBusinessLayerStatus('Saving…');
+    try {
+      const { length } = await apiService.saveBusinessLayer(businessLayerDraft);
+      setBusinessLayerStatus(`Saved (${length} characters). It applies from your next question.`);
+    } catch {
+      setBusinessLayerStatus('Save failed.');
+    } finally {
+      setBusinessLayerBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -852,6 +884,15 @@ function App() {
           <div className="chat-title">
             {currentSessionId ? `Session: ${currentSessionId.substring(0, 20)}...` : 'MAF Data Insight Agent'}
           </div>
+          <div className="header-actions">
+            <button
+              className="icon-btn"
+              onClick={openBusinessLayer}
+              title="Workspace business semantics shared by every session"
+            >
+              📘 Business Layer Doc
+            </button>
+          </div>
         </div>
 
         {(
@@ -967,6 +1008,35 @@ function App() {
         </>
         )}
       </div>
+
+      {businessLayerOpen && (
+        <div className="business-layer-overlay" onClick={() => setBusinessLayerOpen(false)}>
+          <div className="business-layer-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="business-layer-header">
+              <div className="business-layer-title">📘 Business Layer Doc</div>
+              <button className="icon-btn" onClick={() => setBusinessLayerOpen(false)}>✕</button>
+            </div>
+            <div className="business-layer-hint">
+              Describe your business semantics — terminology, metric definitions, and reporting rules.
+              It is shared by the whole workspace and given to the analysis agent with every question,
+              whether Ontology is on or off. Verified Databricks schema always takes precedence.
+            </div>
+            <textarea
+              className="business-layer-textarea"
+              value={businessLayerDraft}
+              onChange={(e) => setBusinessLayerDraft(e.target.value)}
+              disabled={businessLayerBusy}
+              placeholder={'# Terminology\n- VIP customer = a customer whose yearly spend exceeds the agreed threshold\n\n# Metric definitions\n- Revenue = sum of order totals'}
+            />
+            <div className="business-layer-footer">
+              <span className="business-layer-status">{businessLayerStatus}</span>
+              <button className="icon-btn" onClick={persistBusinessLayer} disabled={businessLayerBusy}>
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

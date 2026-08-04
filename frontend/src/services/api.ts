@@ -48,6 +48,17 @@ export const apiService = {
     return response.data;
   },
 
+  // Workspace business semantic layer (shared by every session)
+  async getBusinessLayer(): Promise<{ content: string }> {
+    const response = await apiClient.get<{ content: string }>('/business-layer');
+    return response.data;
+  },
+
+  async saveBusinessLayer(content: string): Promise<{ ok: boolean; length: number }> {
+    const response = await apiClient.put<{ ok: boolean; length: number }>('/business-layer', { content });
+    return response.data;
+  },
+
   // Health check
   async healthCheck(): Promise<{ status: string; agent_initialized: boolean }> {
     const response = await apiClient.get('/health');

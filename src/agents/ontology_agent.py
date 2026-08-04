@@ -138,7 +138,7 @@ class OntologyAgent:
                 Field(description="Optional entity type constraints"),
             ] = None,
         ) -> str:
-            """Describe labels, definitions, hierarchy, restrictions, properties, and assertions."""
+            """Describe labels, annotations, definitions, hierarchy, disjointness, restrictions, properties, and assertions."""
             payload = self.ontology_service.describe_entity(
                 entity,
                 entity_types=entity_types or None,
@@ -336,6 +336,11 @@ class OntologyAgent:
                 payload,
             )
 
+        def list_defined_classes() -> str:
+            """List derived/defined OWL classes (equivalentClass business rules) for concept discovery."""
+            payload = self.ontology_service.list_defined_classes()
+            return self._tool_json("list_defined_classes", {}, payload)
+
         return [
             search_entities,
             describe_entity,
@@ -347,6 +352,7 @@ class OntologyAgent:
             get_lineage,
             get_semantic_candidates,
             get_business_context,
+            list_defined_classes,
         ]
 
     def _create_agent(self, tools: List):

@@ -118,7 +118,7 @@ DEFAULT_ENABLE_ONTOLOGY=true
 ONTOLOGY_DIR=Ontology
 ONTOLOGY_FILE_GLOB=**/*.owl
 ONTOLOGY_ONLY_LOCAL=true
-ONTOLOGY_ENABLE_REASONER=false
+ONTOLOGY_ENABLE_REASONER=true
 ONTOLOGY_REASONER=hermit
 ONTOLOGY_MAX_RESULTS=25
 ONTOLOGY_MAX_DEPTH=5
@@ -130,7 +130,7 @@ ONTOLOGY_AGENT_TIMEOUT_SECONDS=90
 
 `DEFAULT_ENABLE_ONTOLOGY` initializes each new React session independently. The active session's switch is sent with each request and does not affect other sessions.
 
-The current OWL uses `xsd:date`, which HermiT does not support, so reasoning is disabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=true` only for a compatible ontology. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `ontology-sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
+HermiT startup reasoning is enabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=false` to disable it. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `ontology-sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
 
 The normal analytics handoff is linear and does not return to the Master LLM between sub-agents. If DataInsightAgent detects an unexpectedly missing or incomplete handoff, its own MAF loop may recover Metadata or enabled Ontology context once before continuing. Disabled Ontology and known upstream Ontology failures are never retried.
 
@@ -262,7 +262,7 @@ lsof -i :8501
 2. Enable semantic search in Azure Portal and set `AZURE_SEARCH_SEMANTIC_CONFIG`
 3. Test example questions via the React UI
 4. Review logs in `logs/` for debugging
-5. Customize agent prompts in `src/prompts/system_prompts.py`
+5. Customize agent prompts in the per-agent modules under `src/prompts/` (`master.py`, `search.py`, `ontology.py`, `data_insight.py`, `metadata.py`)
 6. Add domain skills to `skills/` directory
 
 ## 🔐 Security Notes

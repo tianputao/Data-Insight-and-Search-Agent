@@ -1091,9 +1091,12 @@ class OntologyService:
                 "type",
                 "labels",
                 "comments",
+                "annotations",
                 "parents",
                 "ancestors",
+                "descendants",
                 "equivalent_to",
+                "disjoint_with",
                 "restrictions",
             )
             if key in primary_description
@@ -1147,6 +1150,40 @@ class OntologyService:
             ],
             warnings=list(dict.fromkeys(warnings)),
             unresolved=unresolved,
+        )
+
+    @_safe_query
+    def list_defined_classes(self) -> dict[str, Any]:
+        """Enumerate classes carrying an equivalentClass definition (derived business concepts)."""
+        if self.world is None:
+            raise RuntimeError("Ontology world has not been created")
+        defined: list[dict[str, Any]] = []
+        for class_entity in self.world.classes():
+            equivalents = list(getattr(class_entity, "equivalent_to", []) or [])
+            if not equivalents:
+                continue
+            record = self._records_by_iri.get(self._known_iri(class_entity))
+            defined.append(
+                {
+                    **self._entity_ref(class_entity),
+                    "labels": list(record.labels) if record else [],
+                    "comments": list(record.comments) if record else [],
+                    "definition": [self._json_value(value) for value in equivalents],
+                    "subclass_of": [
+                        self._entity_ref(parent)
+                        for parent in list(getattr(class_entity, "is_a", []) or [])
+                        if not isinstance(parent, Restriction) and self._known_iri(parent)
+                    ],
+                    "disjoint_with": self._disjoint_refs(class_entity),
+                }
+            )
+            if len(defined) >= self.max_results:
+                break
+        return self._envelope(
+            "ok" if defined else "no_match",
+            data={"defined_classes": defined},
+            confidence=1.0 if defined else 0.0,
+            strategies_tried=["equivalent_class_enumeration"],
         )
 
     def _candidate_root_records(
@@ -1238,6 +1275,51 @@ class OntologyService:
                 )
         return mappings
 
+    def _entity_annotations(self, entity: Any) -> list[dict[str, Any]]:
+        """Return non-label/comment annotation property values for an entity."""
+        if self.world is None:
+            return []
+        annotations: list[dict[str, Any]] = []
+        for prop in self.world.annotation_properties():
+            if str(getattr(prop, "name", "") or "") in {"label", "comment"}:
+                continue
+            try:
+                values = self._property_values(prop, entity)
+            except Exception:
+                continue
+            if not values:
+                continue
+            annotations.append(
+                {
+                    "annotation": self._entity_ref(prop),
+                    "values": [self._json_value(value) for value in values],
+                }
+            )
+            if len(annotations) >= self.max_results:
+                break
+        return annotations
+
+    def _disjoint_refs(self, entity: Any) -> list[dict[str, Any]]:
+        """Return classes explicitly declared disjoint with the given class."""
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            disjoint_sets = list(entity.disjoints())
+        except Exception:
+            return result
+        for disjoint in disjoint_sets:
+            for other in getattr(disjoint, "entities", []) or []:
+                if other is entity:
+                    continue
+                iri = self._known_iri(other)
+                if not iri or iri in seen:
+                    continue
+                seen.add(iri)
+                result.append(self._entity_ref(other))
+                if len(result) >= self.max_results:
+                    return result
+        return result
+
     @staticmethod
     def _is_lineage_question(question: str) -> bool:
         normalized = OntologyService._normalize(question)
@@ -1268,6 +1350,7 @@ class OntologyService:
             **self._entity_ref(entity),
             "labels": list(record.labels),
             "comments": list(record.comments),
+            "annotations": self._entity_annotations(entity),
             "ontology": str(getattr(getattr(entity, "namespace", None), "base_iri", "")),
         }
 
@@ -1285,6 +1368,7 @@ class OntologyService:
                     "ancestors": self._limited_entity_refs(entity.ancestors()),
                     "descendants": self._limited_entity_refs(entity.descendants()),
                     "equivalent_to": [self._json_value(value) for value in list(entity.equivalent_to)],
+                    "disjoint_with": self._disjoint_refs(entity),
                     "restrictions": restrictions,
                     "properties": self._properties_for_class(entity),
                     "instance_count": len(list(entity.instances())),
