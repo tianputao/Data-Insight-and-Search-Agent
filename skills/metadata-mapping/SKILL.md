@@ -64,7 +64,7 @@ available name-component columns. Keep person-name fields and `CompanyName` as s
 | address line 1 / 地址行1 | `salesaddress.AddressLine1` | `STRING` | First street-address line. |
 | address line 2 / 地址行2 | `salesaddress.AddressLine2` | `STRING` | Optional second address line. |
 | city / 城市 | `salesaddress.City` | `STRING` | City field. |
-| state, province, region / 州、省、地区 | `salesaddress.StateProvince` | `STRING` | Address attribute; address role remains a separate choice. |
+| state, province, region / 州、省、地区 | `salesaddress.StateProvince` | `STRING` | State/province field. |
 | country, country region / 国家、国家地区 | `salesaddress.CountryRegion` | `STRING` | Country/region field. |
 | postal code, ZIP / 邮编、邮政编码 | `salesaddress.PostalCode` | `STRING` | Postal-code field. |
 
@@ -129,9 +129,6 @@ columns, but it must not choose an aggregation, grain, inclusion rule, or formul
   reference table-qualified and verify whether it is an identifier or join key.
 - `salesproduct.Size` is overloaded. Do not infer clothing-size or frame-size semantics without an
   explicit definition or Ontology evidence.
-- Region fields do not select shipping, billing, or customer-address role by themselves. Return all
-  verified role candidates and keys without choosing one; downstream planning applies ontology and
-  question evidence, states any reasonable assumption, and asks only when no supported default exists.
 - Amount and quantity fields exist at different physical grains. Return candidates and table grains;
   do not choose an aggregation or silently convert one grain into another.
 - Official concepts such as high-value orders, customer classes, product-category rollups, and

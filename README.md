@@ -16,6 +16,7 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Metadata Browsing**: MetadataAgent lists schemas, tables, and column details from Unity Catalog
 - **Skill- and Ontology-Guided Analytics**: Governed template Skills can route directly to DataInsightAgent; ordinary requests use role-neutral OWL evidence, UC physical verification, and a dynamically loaded planning Skill so the primary model derives SQL at runtime
 - **Session-Scoped Ontology Mode**: Each chat session independently enables or disables ontology enrichment; failures are shown in the thinking panel and fall back to the standard metadata-driven workflow
+- **User-Authored Business Layer**: Business users edit a workspace semantic document in the UI (terminology, metric definitions, reporting rules); it is stored under `data/`, injected into every analytical request, takes effect without a restart, and complements the OWL ontology in both ontology modes
 - **Multi-turn Conversations**: Context-aware dialogue with MAF in-memory thread store; each browser session gets an isolated thread
 - **Concurrent Sessions**: Each thread has independent messages, loading state, MAF history, cancellation, and can run alongside other threads
 - **Stop & Session Cache**: Stop cancels only the active thread; exact repeated questions can reuse a completed answer from the same session without external calls
@@ -29,7 +30,6 @@ An intelligent, enterprise-grade question-answering system powered by Azure Open
 - **Agent Framework**: Microsoft Agent Framework 1.11 — `OpenAIChatCompletionClient`
 - **Primary Frontend**: React + TypeScript (Vite, port 3000)
 - **Backend API**: FastAPI with Server-Sent Events (port 8000)
-- **Secondary Frontend**: Streamlit standalone app (`app.py`, port 8501) — RAG only
 - **Data Analytics**: Azure Databricks Unity Catalog (SQL Warehouse via JDBC)
 - **Ontology Runtime**: Owlready2 with read-only recursive OWL loading; HermiT reasoning is enabled by default
 - **Monitoring**: Azure AI Foundry
@@ -46,7 +46,6 @@ flowchart TD
     subgraph UI["Frontend"]
         direction LR
         React(["React + TypeScript\nport 3000"])
-        Streamlit(["Streamlit\nport 8501"])
     end
 
     subgraph Backend["FastAPI Backend · port 8000"]
@@ -82,9 +81,8 @@ flowchart TD
         SQLW --- UC
     end
 
-    User --> React & Streamlit
+    User --> React
     React -->|SSE stream| API
-    Streamlit -->|direct| MA
     API --> MA
 
     SP -.->|agent-scoped skills| DIA & META
@@ -130,6 +128,7 @@ Comprehensive_AI_Agent/
 │   │   └── settings.py          # AzureOpenAIConfig, AzureSearchConfig,
 │   │                            #   AzureAIFoundryConfig, DatabricksConfig, AppConfig
 │   ├── skills_provider.py       # Agent-scoped native MAF SkillsProvider factory
+│   ├── business_layer.py        # Workspace business semantic document store (data/)
 │   └── utils/
 │       └── logger.py            # Logging utilities
 ├── skills/
@@ -137,7 +136,7 @@ Comprehensive_AI_Agent/
 │   │   ├── SKILL.md             # Intent routing + resource index
 │   │   └── references/
 │   │       └── highest-spending-customer.sql
-│   ├── ontology-sql-planning/   # Skill: dynamic OWL + UC SQL planning method
+│   ├── sql-planning/   # Skill: dynamic OWL + UC SQL planning method
 │   │   └── SKILL.md
 │   └── metadata-mapping/        # Skill: Unity Catalog metadata conventions
 │       └── SKILL.md
@@ -148,11 +147,10 @@ Comprehensive_AI_Agent/
 │   │   └── types/index.ts       # TypeScript type definitions
 │   ├── package.json
 │   └── vite.config.ts
-├── data/                        # Local data sources
+├── data/                        # Local data sources (incl. business_layer.md, git-ignored)
 ├── tmp/                         # Temporary files
 ├── logs/                        # Application logs (application_YYYYMMDD.log)
-├── app.py                       # Standalone Streamlit UI (RAG-only mode)
-├── run.sh                       # Launcher: full-stack, backend, frontend, streamlit
+├── run.sh                       # Launcher: full-stack, backend, frontend
 ├── requirements.txt             # Python dependencies
 ├── .env.example                 # Environment variables template
 └── README.md                    # This file
@@ -217,7 +215,6 @@ AZURE_OPENAI_AUTH_MODE=aad
 ./run.sh             # Full stack: FastAPI (port 8000) + React (port 3000)
 ./run.sh backend     # FastAPI only
 ./run.sh frontend    # React dev server only
-./run.sh streamlit   # Standalone Streamlit UI (port 8501, RAG only)
 ```
 
 Access the React UI at `http://localhost:3000`.
@@ -231,6 +228,7 @@ Access the React UI at `http://localhost:3000`.
 3. **Streaming Responses**: Answers stream token-by-token; "thinking" steps appear above the answer
 4. **Citations**: Inline footnotes `[1]`, `[2]` link to source documents when a URL is available; plain-text titles are shown for internal documents without a public URL
 5. **Ontology mode**: Use the sidebar switch to enable ontology enrichment for the current session only
+6. **Business Layer Doc**: Click the button in the chat header to edit the workspace semantic document (terminology, metric definitions, reporting conventions). It is shared by every session and applies from your next question — no restart required. Prefer recording what the OWL ontology does *not* already define, and note that verified Databricks schema always takes precedence.
 
 ### Question Types
 
@@ -251,9 +249,9 @@ Controlled via `.env` defaults or at runtime via the frontend:
 | `DEFAULT_ENABLE_AGENTIC_RETRIEVAL` | `true` | Azure-managed agentic retrieval mode |
 | `DEFAULT_ENABLE_ONTOLOGY` | `true` | Initial Ontology switch value for each new chat session |
 
-With Ontology enabled, analytical questions start in OntologyAgent using the small model. A confirmed governed template match skips Owlready2 and MetadataAgent, then DataInsightAgent loads the named Skill and indexed resource. Non-template questions run `role-neutral OntologyAgent → skill-free Metadata verifier → DataInsightAgent`, where the primary model loads `ontology-sql-planning` and dynamically chooses analytical roles, grain, comparisons, and SQL.
+With Ontology enabled, analytical questions start in OntologyAgent using the small model. A confirmed governed template match skips Owlready2 and MetadataAgent, then DataInsightAgent loads the named Skill and indexed resource. Non-template questions run `role-neutral OntologyAgent → skill-free Metadata verifier → DataInsightAgent`, where the primary model loads `sql-planning` and dynamically chooses analytical roles, grain, comparisons, and SQL.
 
-With Ontology disabled or unavailable, analytical questions run `MetadataAgent (progressively loads metadata-mapping) → DataInsightAgent`. Every non-governed DataInsight request loads `ontology-sql-planning`; without Ontology it applies the same dynamic method using the original question and verified Metadata only, without inventing semantic evidence. MasterAgent and DataInsightAgent use the primary GPT deployment; Ontology and both Metadata modes use `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT`.
+With Ontology disabled or unavailable, analytical questions run `MetadataAgent (progressively loads metadata-mapping) → DataInsightAgent`. Every non-governed DataInsight request loads `sql-planning`; without Ontology it applies the same dynamic method using the original question and verified Metadata only, without inventing semantic evidence. MasterAgent and DataInsightAgent use the primary GPT deployment; Ontology and both Metadata modes use `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT`.
 
 ## ⚙️ Configuration Reference
 

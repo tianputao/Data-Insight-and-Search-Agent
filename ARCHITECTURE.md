@@ -11,7 +11,6 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                React + TypeScript Frontend (Vite, port 3000)     │
-│              OR  Streamlit App (app.py, port 8501 — RAG only)    │
 └──────────────────────────────┬───────────────────────────────────┘
                                │  SSE / REST  (FastAPI, port 8000)
                                ▼
@@ -70,17 +69,13 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 
 ### 1. Frontend Layer
 
-**Primary UI** — React + TypeScript (Vite, `frontend/`)
+**React + TypeScript** (Vite, `frontend/`)
 - Chat interface with token-by-token streaming
 - "Thinking" step panel showing live agent reasoning
 - Inline citation footnotes `[1]`, `[2]` with optional hyperlinks
 - Per-session conversation threads via `/threads/new` REST call
 - Per-session Ontology switch initialized from the backend environment default
-
-**Secondary UI** — Streamlit (`app.py`)
-- Standalone single-page app, requires no Node.js
-- Supports RAG (SearchAgent) only; no Databricks agents
-- Useful for quick local testing
+- Workspace **Business Layer Doc** editor in the chat header
 
 ### 2. FastAPI Backend (`src/api/main.py`)
 
@@ -93,6 +88,10 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `GET` | `/threads` | List all active threads |
 | `GET` | `/threads/{id}/history` | Message history for a thread |
 | `DELETE` | `/threads/{id}` | Delete a thread |
+| `POST` | `/threads/{id}/stop` | Cancel the active run of one thread only |
+| `GET` | `/business-layer` | Read the workspace business semantic document |
+| `PUT` | `/business-layer` | Save the workspace business semantic document |
+| `GET` | `/proxy-image` | Proxy Blob Storage images so the browser avoids CORS failures |
 | `GET` | `/skills` | List registered skills |
 | `GET` | `/config` | Non-sensitive runtime defaults and ontology capability status |
 | `GET` | `/health` | Health check |
@@ -174,7 +173,9 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 
 **Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. HermiT reasoning is enabled by default and can be disabled via `ONTOLOGY_ENABLE_REASONER=false`.
 
-**Tools**: `search_entities`, `describe_entity`, `expand_neighbors`, `find_paths`, `find_related_by_type`, `get_schema_mapping`, `get_join_paths`, `get_lineage`, `get_semantic_candidates`, and `get_business_context`.
+**Tools**: `search_entities`, `describe_entity`, `expand_neighbors`, `find_paths`, `find_related_by_type`, `get_schema_mapping`, `get_join_paths`, `get_lineage`, `get_semantic_candidates`, `list_defined_classes`, and `get_business_context`.
+
+`describe_entity` also returns explicit `disjoint_with` classes and non-label annotation values, and `list_defined_classes` enumerates equivalentClass-defined business concepts (for example a threshold-defined order class) together with their rendered definitions.
 
 Entity resolution combines exact IRI/name, multilingual labels, normalized tokens, type constraints, and fuzzy candidates. Query tools return stable JSON envelopes with evidence, confidence, attempted strategies, warnings, and unresolved concepts. Physical joins remain empty unless an OWL annotation explicitly grounds them.
 
@@ -193,7 +194,7 @@ HermiT may reject ontology datatypes outside its OWL 2 datatype map. A reasoner 
 | `execute_sql` | Runs a SQL query against the Databricks SQL Warehouse; returns rows as JSON |
 | `recover_metadata_context` | Exceptional, once-per-request MetadataAgent recovery when the schema handoff is missing or incomplete |
 | `recover_ontology_context` | Exceptional, once-per-request OntologyAgent recovery when ontology was enabled but context is unexpectedly missing |
-| Native Skills | `SkillsProvider` advertises governed templates plus `ontology-sql-planning` on demand |
+| Native Skills | `SkillsProvider` advertises governed templates plus `sql-planning` on demand |
 
 **Configuration**: `DatabricksConfig` — `HOST`, `TOKEN`, `HTTP_PATH`, `CATALOG`, `SCHEMAS` (comma-separated list), `MAX_ROWS`, `QUERY_TIMEOUT`. The agent is only instantiated when `DatabricksConfig.is_configured()` returns `True`.
 
@@ -217,7 +218,7 @@ For analytics, MetadataAgent retains its native MAF model/tool loop. The model s
 
 ### 8. Skill System
 
-**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. OntologyAgent receives governed template routing Skills; DataInsightAgent receives those governed Skills plus `ontology-sql-planning`; Metadata discovery receives `metadata-mapping`; Metadata verification, MasterAgent, and SearchAgent receive no data Skills.
+**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. OntologyAgent receives governed template routing Skills; DataInsightAgent receives those governed Skills plus `sql-planning`; Metadata discovery receives `metadata-mapping`; Metadata verification, MasterAgent, and SearchAgent receive no data Skills.
 
 MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on demand, then optionally read resources or execute approval-gated scripts.
 
@@ -226,10 +227,19 @@ MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on
 | Skill | Purpose |
 |-------|---------|
 | `analytics-spec` | Governed highest-spending-customer SQL template and matching contract |
-| `ontology-sql-planning` | Dynamic planning and SQL engineering method for every non-governed query; uses OWL when available and verified UC in all modes |
+| `sql-planning` | Dynamic planning and SQL engineering method for every non-governed query; uses OWL when available and verified UC in all modes |
 | `metadata-mapping` | Unity Catalog metadata field mapping rules |
 
-### 9. AzureAISearchTool (`src/tools/ai_search_tool.py`)
+### 9. Business Semantic Layer (`src/business_layer.py`)
+
+A workspace-level document that business users author in the UI (**Business Layer Doc** in the chat header) to record terminology, metric definitions, and reporting conventions that the OWL ontology does not define.
+
+- **Storage**: a plain data file at `data/business_layer.md`, never imported or executed as code. `load_business_layer()` / `save_business_layer()` are the only entry points, so moving to Blob or a database changes just those two functions.
+- **Delivery**: `chat_stream` reads the document on every request and threads it through `QueryEngineContext` to DataInsightAgent, which wraps it as `<business_layer_context>`. Because it is read per request rather than baked into a system prompt, edits take effect on the next question with no restart.
+- **Precedence**: advisory only. It ranks below `<schema_context>`, cannot override verified Unity Catalog objects, and is treated as reference data — the prompt instructs the model to ignore any embedded instruction, and the SELECT-only plus catalog/schema guards in `execute_sql` remain the enforcing control.
+- **Scope**: applies whether Ontology is enabled or disabled, and is empty (block omitted entirely) until someone saves content.
+
+### 10. AzureAISearchTool (`src/tools/ai_search_tool.py`)
 
 - `search()`: Main async search entrypoint — dispatches to `_search_standard` or `_search_with_agentic_mode`
 - `_search_standard`: Builds `VectorizedQuery` + `SearchOptions`; supports hybrid + semantic reranking
@@ -291,9 +301,11 @@ Ontology enabled for this session?
       ↓
 DataInsightAgent receives canonical ontology evidence (when available) plus independent authoritative schema context and reconciles both before SQL
       ↓
+The workspace business layer document, when non-empty, is attached as <business_layer_context> in both ontology modes
+      ↓
 DataInsightAgent.query_stream()
       ├── governed route → load template Skill + indexed SQL resource
-      ├── ordinary ontology route → load_skill("ontology-sql-planning")
+      ├── ordinary ontology route → load_skill("sql-planning")
       │      └── primary model dynamically selects metric, grain, comparisons, and SQL
       ├── recover_* only if an expected context handoff is missing/incomplete
   ├── execute_sql(sql)              → Databricks SQL Warehouse

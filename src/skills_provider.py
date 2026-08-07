@@ -14,7 +14,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 _SKILLS_ROOT = _PROJECT_ROOT / "skills"
 
 _AGENT_SKILL_DIRECTORIES: dict[str, tuple[str, ...]] = {
-    "DataInsightAgent": ("analytics-spec", "ontology-sql-planning"),
+    "DataInsightAgent": ("analytics-spec", "sql-planning"),
     "MetadataAgent": ("metadata-mapping",),
     "OntologyAgent": ("analytics-spec",),
 }

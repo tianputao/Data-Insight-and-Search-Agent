@@ -17,7 +17,7 @@
 | **MasterAgent** | Orchestration and routing | `decompose_query`, `search_multiple_queries`, `search_knowledge`, `delegate_metadata`, `delegate_data_analysis` |
 | **SearchAgent** | Azure AI Search hybrid retrieval | `search_knowledge_base`, `parallel_search` |
 | **OntologyAgent** | Read-only OWL business semantics and multi-hop paths | `search_entities`, `describe_entity`, `find_paths`, `get_join_paths`, `get_business_context`, and related Owlready2 tools |
-| **DataInsightAgent** | Databricks Unity Catalog SQL analytics | `execute_sql`; bounded context recovery; governed template Skills plus native `ontology-sql-planning` |
+| **DataInsightAgent** | Databricks Unity Catalog SQL analytics | `execute_sql`; bounded context recovery; governed template Skills plus native `sql-planning` |
 | **MetadataAgent** | Unity Catalog schema browsing | `list_schemas`, `list_tables`, `get_table_details`, `search_tables`; native `metadata-mapping` Skill |
 
 Agents use Azure OpenAI through Microsoft Agent Framework 1.11 and `OpenAIChatCompletionClient`: Master/DataInsight use the primary deployment, while Ontology/Metadata use the configured small deployment.
@@ -26,19 +26,18 @@ Agents use Azure OpenAI through Microsoft Agent Framework 1.11 and `OpenAIChatCo
 
 Plugin-based skills in `skills/`:
 - **`analytics-spec`** — data analytics query conventions
-- **`ontology-sql-planning`** — dynamic OWL + verified UC query-planning method
+- **`sql-planning`** — dynamic OWL + verified UC query-planning method
 - **`metadata-mapping`** — Unity Catalog metadata field mapping
 
 MAF `SkillsProvider` discovers `SKILL.md` files, advertises only the Skills assigned to each agent, and registers native load/resource/script tools. Read-only loading is trusted; script execution remains approval-gated.
 
-### 🖥️ Dual Frontend
+### 🖥️ Run Modes
 
 | Mode | Command | Port | Notes |
 |------|---------|------|-------|
 | Full Stack (React) | `./run.sh` | 3000 (UI) + 8000 (API) | Streaming SSE, all 5 agents |
 | Backend only | `./run.sh backend` | 8000 | FastAPI |
 | Frontend only | `./run.sh frontend` | 3000 | React dev server |
-| Streamlit | `./run.sh streamlit` | 8501 | RAG only, no Databricks agents |
 
 ### 🗂️ Key Files
 
@@ -55,19 +54,19 @@ src/
 ├── api/main.py               # FastAPI backend + SSE streaming + citation pipeline
 ├── config/settings.py        # All config classes (OpenAI, Search, Databricks, App)
 ├── skills_provider.py        # Native MAF SkillsProvider factory/API adapter
+├── business_layer.py         # Workspace business semantic document store (data/business_layer.md)
 ├── tools/ai_search_tool.py   # Azure AI Search: hybrid, semantic, agentic modes
 └── prompts/                  # Per-agent system prompts (master, search, ontology, data_insight, metadata)
 skills/
 ├── analytics-spec/
 │   ├── SKILL.md
 │   └── references/highest-spending-customer.sql
-├── ontology-sql-planning/SKILL.md
+├── sql-planning/SKILL.md
 └── metadata-mapping/SKILL.md
 frontend/src/
 ├── App.tsx                   # Chat UI + citation normalization
 ├── services/api.ts           # SSE client
 └── types/index.ts
-app.py                        # Standalone Streamlit UI (RAG only)
 Ontology/*.owl                # Read-only business ontologies
 run.sh                        # Launcher script
 ```
@@ -82,6 +81,7 @@ run.sh                        # Launcher script
 - ✅ **Optional Databricks** — DataInsight and Metadata agents gracefully absent when not configured
 - ✅ **Ontology-guided SQL** — session-selectable role-neutral OWL properties, restrictions, lineage, and semantic paths before UC verification and model-driven planning
 - ✅ **Visible fallback** — Ontology failures are shown in the thinking panel before standard metadata-driven analysis continues
+- ✅ **User-authored business layer** — business users edit a workspace semantic document in the UI; it is read per request, so edits apply without restarting the agent
 - ✅ **Comprehensive logging** — `logs/application_YYYYMMDD.log`
 
 ---
@@ -116,8 +116,6 @@ AZURE_SEARCH_INDEX_NAME=your-index-name
 ### Step 3: Run
 ```bash
 ./run.sh            # React UI at http://localhost:3000
-# or
-./run.sh streamlit  # Streamlit UI at http://localhost:8501
 ```
 
 ---
@@ -173,7 +171,7 @@ MasterAgent (primary GPT deployment, main AgentSession + bounded agentic loop)
                             Ontology on? → OntologyAgent progressively matches governed Skills
                                    match → DataInsightAgent loads Skill + governed SQL resource
                                    no match → role-neutral OWL → Metadata verifier
-                                            → DataInsightAgent loads ontology-sql-planning
+                                            → DataInsightAgent loads sql-planning
                             Ontology off/fallback? → MetadataAgent loads metadata-mapping → DataInsightAgent
                     → Databricks SQL
   Schema?  → delegate_metadata       → MetadataAgent   → Unity Catalog

@@ -9,7 +9,7 @@ from typing import Annotated, Any, List, Optional
 
 from pydantic import Field
 
-from ..config import AzureOpenAIConfig, OntologyConfig
+from ..config import AgentReasoningConfig, AzureOpenAIConfig, OntologyConfig
 from ..ontology import OntologyService
 from ..prompts import ONTOLOGY_AGENT_PROMPT
 from ..skills_provider import create_skills_provider
@@ -75,11 +75,14 @@ class OntologyAgent:
             "data": {
                 "root_entity": data.get("root_entity"),
                 "root_entity_detail": data.get("root_entity_detail"),
+                # Declared once so property IRIs stay reconstructible as prefix + name.
+                "ontology_iri_prefix": data.get("ontology_iri_prefix"),
                 "filters": data.get("filters", []),
                 "semantic_properties": data.get("semantic_properties", []),
                 "semantic_relationships": data.get(
                     "semantic_relationships", []
                 ),
+                "hierarchy_relations": data.get("hierarchy_relations", []),
                 "join_paths": [
                     {
                         "semantic_path": path.get("semantic_path", []),
@@ -94,6 +97,8 @@ class OntologyAgent:
                 "lineage": data.get("lineage"),
                 "entity_candidates": data.get("entity_candidates", []),
             },
+            # Kept so the UI activity badge reports the real root-resolution count.
+            "matches": payload.get("matches", []),
             "confidence": payload.get("confidence"),
             "warnings": payload.get("warnings", []),
             "unresolved": payload.get("unresolved", []),
@@ -318,7 +323,7 @@ class OntologyAgent:
                 str,
                 Field(description="Optional known root entity name or IRI"),
             ] = "",
-            max_depth: Annotated[int, Field(description="Maximum semantic discovery depth")] = 3,
+            max_depth: Annotated[int, Field(description="Maximum semantic discovery depth")] = OntologyConfig.MAX_DEPTH,
         ) -> str:
             """Build composite business context for MetadataAgent and DataInsightAgent."""
             payload = self.ontology_service.get_business_context(
@@ -369,9 +374,9 @@ class OntologyAgent:
             name="OntologyAgent",
             instructions=ONTOLOGY_AGENT_PROMPT + runtime_context,
             tools=tools,
-            temperature=0.1,
+            reasoning_effort=AgentReasoningConfig.ONTOLOGY,
             context_providers=[skills_provider] if skills_provider else None,
-            model=AzureOpenAIConfig.SMALL_GPT_DEPLOYMENT,
+            model=AzureOpenAIConfig.GPT_DEPLOYMENT,
             max_iterations=OntologyConfig.AGENT_MAX_MODEL_ROUNDTRIPS,
             max_function_calls=OntologyConfig.AGENT_MAX_FUNCTION_CALLS,
         )
@@ -397,6 +402,128 @@ class OntologyAgent:
                     f"Verified schema context could not be attached: {exc}"
                 )
         return self._as_json(payload)
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _result_data(item: dict[str, Any]) -> dict[str, Any]:
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return {}
+        data = result.get("data")
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _covered_by_composite(
+        cls,
+        item: dict[str, Any],
+        primary_data: dict[str, Any],
+    ) -> bool:
+        """Return True only when every fact in this result already appears in the composite."""
+        data = cls._result_data(item)
+        if not data:
+            return False
+        tool = item.get("tool")
+        if tool == "get_semantic_candidates":
+            properties = [
+                value for value in data.get("semantic_properties", []) if isinstance(value, dict)
+            ]
+            relationships = [
+                value for value in data.get("semantic_relationships", []) if isinstance(value, dict)
+            ]
+            if not properties and not relationships:
+                return False
+            known_properties = {
+                (value.get("name"), value.get("entity"))
+                for value in primary_data.get("semantic_properties", [])
+                if isinstance(value, dict)
+            }
+            known_relationships = {
+                cls._stable_json(value)
+                for value in primary_data.get("semantic_relationships", [])
+                if isinstance(value, dict)
+            }
+            return all(
+                (value.get("name"), value.get("entity")) in known_properties
+                for value in properties
+            ) and all(
+                cls._stable_json(value) in known_relationships for value in relationships
+            )
+        if tool == "get_join_paths":
+            paths = [value for value in data.get("join_paths", []) if isinstance(value, dict)]
+            if not paths:
+                return False
+            known_paths = {
+                tuple(value.get("semantic_path") or [])
+                for value in primary_data.get("join_paths", [])
+                if isinstance(value, dict)
+            }
+            return all(
+                tuple(value.get("semantic_path") or []) in known_paths for value in paths
+            )
+        return False
+
+    @classmethod
+    def _prune_tool_results(
+        cls,
+        additional: list[dict[str, Any]],
+        primary_data: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Drop only provably redundant results and record every removal."""
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        seen_calls: set[tuple[str, str]] = set()
+        seen_payloads: set[str] = set()
+
+        for item in additional:
+            tool = str(item.get("tool") or "")
+            call_key = (tool, cls._stable_json(item.get("arguments") or {}))
+            payload_key = cls._stable_json(item.get("result"))
+            if call_key in seen_calls:
+                reason = "identical repeated call"
+            elif payload_key in seen_payloads:
+                reason = "identical result payload"
+            elif cls._covered_by_composite(item, primary_data):
+                reason = "every fact already present in get_business_context"
+            else:
+                seen_calls.add(call_key)
+                seen_payloads.add(payload_key)
+                kept.append(item)
+                continue
+            removed.append(
+                {"tool": tool, "arguments": item.get("arguments", {}), "reason": reason}
+            )
+
+        pruning: dict[str, Any] = {
+            "removed_redundant": removed,
+            "kept_count": len(kept),
+            "policy": (
+                "lossless: only exact repeats or results whose every fact is already "
+                "present in the composite business context are removed"
+            ),
+        }
+
+        budget = OntologyConfig.CONTEXT_MAX_CHARS
+        if budget > 0:
+            removed_for_budget: list[dict[str, Any]] = []
+            while kept and len(cls._stable_json(kept)) > budget:
+                victim = kept.pop()
+                removed_for_budget.append(
+                    {"tool": victim.get("tool"), "arguments": victim.get("arguments", {})}
+                )
+            if removed_for_budget:
+                pruning["removed_for_budget"] = removed_for_budget
+                pruning["budget_chars"] = budget
+                pruning["budget_warning"] = (
+                    "Size-based removal is lossy; raise ONTOLOGY_CONTEXT_MAX_CHARS or set it "
+                    "to 0 to keep all evidence."
+                )
+        return kept, pruning
 
     @staticmethod
     def build_collected_context(
@@ -442,13 +569,14 @@ class OntologyAgent:
             None,
         )
         primary = primary_item.get("result") if primary_item else None
-        additional_tool_results = [
-            item for item in tool_results if item is not primary_item
-        ]
         primary_data = (
             primary.get("data")
             if isinstance(primary, dict) and isinstance(primary.get("data"), dict)
             else primary if isinstance(primary, dict) else {}
+        )
+        additional_tool_results, evidence_pruning = OntologyAgent._prune_tool_results(
+            [item for item in tool_results if item is not primary_item],
+            primary_data,
         )
         compact_properties = [
             {
@@ -494,6 +622,7 @@ class OntologyAgent:
                 ),
                 "primary_business_context": primary,
                 "semantic_summary": semantic_summary,
+                "evidence_pruning": evidence_pruning,
                 "additional_tool_results": additional_tool_results,
             },
             ensure_ascii=False,

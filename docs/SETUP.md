@@ -130,7 +130,7 @@ ONTOLOGY_AGENT_TIMEOUT_SECONDS=90
 
 `DEFAULT_ENABLE_ONTOLOGY` initializes each new React session independently. The active session's switch is sent with each request and does not affect other sessions.
 
-HermiT startup reasoning is enabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=false` to disable it. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `ontology-sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
+HermiT startup reasoning is enabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=false` to disable it. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
 
 The normal analytics handoff is linear and does not return to the Master LLM between sub-agents. If DataInsightAgent detects an unexpectedly missing or incomplete handoff, its own MAF loop may recover Metadata or enabled Ontology context once before continuing. Disabled Ontology and known upstream Ontology failures are never retried.
 
@@ -149,16 +149,28 @@ DATABRICKS_METADATA_CACHE_TTL_SECONDS=900
 When these are not set, `DatabricksConfig.is_configured()` returns `False` and both agents are skipped.
 Metadata tools cache only objects they actually request: catalog schemas, table summaries for a specific schema, and details for a selected fully-qualified table. The cache is not question-scoped and never preloads every table's columns. Set the TTL to `0` for a process-lifetime object cache.
 
-### Step 7: Run the Application
+### Step 7: (Optional) Author the Business Layer Document
+
+Business users can describe semantics the OWL ontology does not define — terminology, metric definitions, and reporting conventions. Open the React UI and click **Business Layer Doc** in the chat header, or call the API directly:
+
+```bash
+curl http://localhost:8000/business-layer
+curl -X PUT http://localhost:8000/business-layer \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "# Metric definitions\n- Revenue uses the order total, not the subtotal\n"}'
+```
+
+The text is stored at `data/business_layer.md` (git-ignored), shared by every session, and read on each request, so edits apply to the next question without restarting. It is advisory: verified Unity Catalog schema always wins, and the document is never treated as instructions. No configuration is required — when the file is absent the feature stays inert.
+
+### Step 8: Run the Application
 
 ```bash
 ./run.sh             # Full stack: FastAPI (port 8000) + React (port 3000)
 ./run.sh backend     # FastAPI only
 ./run.sh frontend    # React dev server only
-./run.sh streamlit   # Standalone Streamlit UI (port 8501, RAG only)
 ```
 
-Open your browser to `http://localhost:3000` (React) or `http://localhost:8501` (Streamlit).
+Open your browser to `http://localhost:3000`.
 
 ## 🔍 Verify Installation
 
@@ -248,13 +260,6 @@ DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH
 1. Confirm FastAPI is running: `curl http://localhost:8000/health`
 2. Check CORS origins in `src/api/main.py` include `http://localhost:3000`
 3. Confirm `VITE_API_URL` in `frontend/.env` (if set) points to `http://localhost:8000`
-
-### Streamlit won't start
-
-```bash
-lsof -i :8501
-./run.sh streamlit   # uses port 8501
-```
 
 ## 📚 Next Steps
 

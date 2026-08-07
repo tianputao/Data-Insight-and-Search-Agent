@@ -218,6 +218,33 @@ def _normalize_cache_question(question: str) -> str:
     return " ".join(normalized.split())
 
 
+_CACHE_FAILURE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    for pattern in (
+        r"\b(?:timed?\s*out|timeout)\b",
+        r"\b(?:please\s+)?(?:try|retry)\s+again\b",
+        r"\bno\s+(?:reliable|usable)\s+(?:result|answer)\b",
+        r"\b(?:connection|network|service|request|query|analysis|agent)\b.{0,40}\b(?:failed|failure|error|unavailable|reset|refused|interrupted)\b",
+        r"\b(?:unable|failed)\s+to\s+(?:obtain|retrieve|generate|complete|confirm|return)\b",
+        r"超时",
+        r"请(?:稍后)?重试",
+        r"(?:网络|连接).{0,20}(?:错误|异常|中断|失败|重置)",
+        r"(?:未能|无法|暂时无法).{0,30}(?:获得|获取|生成|完成|确认|返回).{0,20}(?:结果|答案)?",
+        r"(?:查询|分析|请求|代理|服务).{0,20}(?:失败|错误|不可用|异常)",
+    )
+)
+
+
+def _response_cache_eligibility(response: str) -> tuple[bool, str]:
+    """Classify whether a completed response is safe to reuse as an answer."""
+    text = unicodedata.normalize("NFKC", str(response or "")).strip()
+    if not text:
+        return False, "empty_response"
+    if any(pattern.search(text) for pattern in _CACHE_FAILURE_PATTERNS):
+        return False, "failure_response"
+    return True, "completed_response"
+
+
 def _find_cached_response(
     thread_id: str,
     question: str,
@@ -241,6 +268,7 @@ def _find_cached_response(
         if (
             _normalize_cache_question(str(turn.get("user") or "")) == cache_key
             and str(turn.get("assistant") or "").strip()
+            and turn.get("cache_eligible") is True
             and turn.get("enable_ontology") is enable_ontology
         ):
             return str(turn["assistant"])
@@ -736,36 +764,80 @@ def _normalize_citations_and_references(
     return body, ref_lines
 
 
-def _repair_collapsed_markdown_tables(text: str) -> str:
-    """Restore newlines when a model flattens an entire GFM table into one line.
+def _table_row_cells(row: str) -> Optional[List[str]]:
+    stripped = row.strip()
+    if len(stripped) < 2 or not stripped.startswith("|") or not stripped.endswith("|"):
+        return None
+    return stripped[1:-1].split("|")
 
-    A flattened table contains a markdown separator cell (``---``) and adjacent
-    closing/opening row pipes (``| |`` or ``||``). Normal multiline tables and
-    ordinary prose containing pipes are left unchanged.
+
+def _is_table_separator_row(cells: List[str]) -> bool:
+    return bool(cells) and all(
+        re.fullmatch(r"\s*:?-{3,}:?\s*", cell) for cell in cells
+    )
+
+
+def _split_collapsed_table_row(
+    line: str,
+    expected_cells: Optional[int],
+) -> Optional[List[str]]:
+    """Split one flattened line into table rows, or return None to leave it alone."""
+    candidates = re.sub(r"\|\s*\|", "|\n|", line).splitlines()
+    if len(candidates) < 2:
+        return None
+    parsed = [_table_row_cells(candidate) for candidate in candidates]
+    if any(cells is None for cells in parsed):
+        return None
+    widths = {len(cells) for cells in parsed if cells is not None}
+    if len(widths) != 1:
+        return None
+    width = widths.pop()
+    if expected_cells is not None:
+        # A row with genuinely empty cells splits into the wrong width, so it stays intact.
+        return candidates if width == expected_cells else None
+    return (
+        candidates
+        if any(_is_table_separator_row(cells) for cells in parsed if cells)
+        else None
+    )
+
+
+def _repair_collapsed_markdown_tables(text: str) -> str:
+    """Restore newlines when a model flattens GFM table rows onto one line.
+
+    Rows are only split when every resulting row matches the table's column
+    count, so ordinary prose and rows with empty cells are left unchanged.
     """
     if not text or "|" not in text:
         return text
 
     repaired_lines: List[str] = []
     in_fence = False
-    separator_pattern = re.compile(r"\|\s*:?-{3,}:?\s*\|")
-    row_boundary_pattern = re.compile(r"\|\s*\|")
+    expected_cells: Optional[int] = None
 
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
+            expected_cells = None
             repaired_lines.append(line)
             continue
 
-        if (
-            not in_fence
-            and line.count("|") >= 6
-            and separator_pattern.search(line)
-            and row_boundary_pattern.search(line)
-        ):
-            repaired_lines.extend(row_boundary_pattern.sub("|\n|", line).splitlines())
-        else:
+        cells = None if in_fence else _table_row_cells(line)
+        if cells is None:
+            expected_cells = None
             repaired_lines.append(line)
+            continue
+
+        rows = _split_collapsed_table_row(line, expected_cells)
+        if rows is None:
+            repaired_lines.append(line)
+            if _is_table_separator_row(cells):
+                expected_cells = len(cells)
+            continue
+
+        repaired_lines.extend(rows)
+        first_row = _table_row_cells(rows[0])
+        expected_cells = len(first_row) if first_row else None
 
     return "\n".join(repaired_lines)
 
@@ -790,6 +862,7 @@ async def _stream_agent_response(
     search_ref_map: Dict[str, tuple[str, str]] = {}
     _working_text_parts: List[str] = []
     _working_text_id = 1
+    cache_failure_observed = False
 
     # ── Single combined queue — avoids all polling ────────────────────────────
     combined: asyncio.Queue = asyncio.Queue()
@@ -866,6 +939,20 @@ async def _stream_agent_response(
         _working_text_parts = []
         if not text:
             return []
+        if (
+            not enable_ontology
+            and _pending_call_name == "delegate_data_analysis"
+            and re.search(r"ontology\s*agent|ontologyagent|本体", text, re.IGNORECASE)
+        ):
+            text = (
+                "我会让 MetadataAgent 核验所需表、字段和连接，再由 "
+                "DataInsightAgent 执行分析。"
+                if re.search(r"[\u3400-\u9fff]", text)
+                else (
+                    "MetadataAgent will verify the required tables, fields, and joins; "
+                    "DataInsightAgent will then run the analysis."
+                )
+            )
         full_response_parts.clear()
         return [
             _sse({"type": "answer_reset"}),
@@ -896,7 +983,8 @@ async def _stream_agent_response(
 
     def _process_maf_update(update) -> List[str]:
         """Convert one MAF update object → list of SSE strings."""
-        nonlocal _pending_call_id, _pending_call_name, _pending_call_args, search_ref_map
+        nonlocal _pending_call_id, _pending_call_name, _pending_call_args
+        nonlocal search_ref_map, cache_failure_observed
         events: List[str] = []
 
         # Ordinary assistant text is streamed immediately. If a tool call follows,
@@ -955,12 +1043,18 @@ async def _stream_agent_response(
 
             elif ct == "function_result":
                 result_payload = getattr(content, "result", None)
+                exception = getattr(content, "exception", None)
+                _, result_reason = _response_cache_eligibility(
+                    str(result_payload or "")
+                )
+                if exception or result_reason == "failure_response":
+                    cache_failure_observed = True
                 parsed_refs = _extract_search_references_from_payload(result_payload)
                 if parsed_refs:
                     _merge_references(search_ref_map, parsed_refs)
                 events.extend(_flush_pending_call())
                 call_id = getattr(content, "call_id", "") or ""
-                completed = _end_tool(call_id, error=bool(getattr(content, "exception", None)))
+                completed = _end_tool(call_id, error=bool(exception))
                 if completed:
                     events.append(completed)
         return events
@@ -997,6 +1091,8 @@ async def _stream_agent_response(
                     _merge_references(search_ref_map, item_data)
 
             elif item_type == "activity" and isinstance(item_data, dict):
+                if item_data.get("state") == "error":
+                    cache_failure_observed = True
                 yield _sse({"type": "thinking", **item_data})
 
     except Exception as exc:
@@ -1055,11 +1151,13 @@ async def _stream_agent_response(
     # Ensure every blob URL in the final answer is signed, regardless of how the LLM formats it.
     full_response = _patch_blob_urls_with_sas(full_response)
 
+    response_cache_eligible, _ = _response_cache_eligibility(full_response)
     _append_history(
         thread_id,
         message,
         full_response,
         enable_ontology=enable_ontology,
+        cache_eligible=(response_cache_eligible and not cache_failure_observed),
     )
 
     yield _sse({"type": "thinking_done"})
@@ -1093,16 +1191,30 @@ def _append_history(
     *,
     cache_hit: bool = False,
     enable_ontology: bool,
+    cache_eligible: Optional[bool] = None,
 ) -> None:
     """Store a completed turn in the thread history."""
     if thread_id not in state.thread_history:
         state.thread_history[thread_id] = []
+    inferred_eligible, eligibility_reason = _response_cache_eligibility(
+        assistant_msg
+    )
+    effective_eligible = (
+        inferred_eligible if cache_eligible is None else bool(cache_eligible)
+    )
+    if cache_hit:
+        effective_eligible = True
+        eligibility_reason = "cache_hit"
+    elif not effective_eligible and eligibility_reason == "completed_response":
+        eligibility_reason = "explicitly_ineligible"
     state.thread_history[thread_id].append(
         {
             "user": user_msg,
             "assistant": assistant_msg,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "cache_hit": cache_hit,
+            "cache_eligible": effective_eligible,
+            "cache_eligibility_reason": eligibility_reason,
             "enable_ontology": enable_ontology,
         }
     )

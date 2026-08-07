@@ -15,7 +15,7 @@ from .search_agent import SearchAgent
 from .data_insight_agent import DataInsightAgent
 from .metadata_agent import MetadataAgent
 from .ontology_agent import OntologyAgent
-from ..config import AppConfig, DatabricksConfig, OntologyConfig
+from ..config import AgentReasoningConfig, AppConfig, DatabricksConfig, OntologyConfig
 from ..prompts import MASTER_AGENT_PROMPT
 from ..query_engine import QueryEngineContext
 from ..skills_provider import (
@@ -118,6 +118,26 @@ class MasterAgent:
             business_layer=business_layer,
             stream_context=stream_context,
             cancel_event=cancel_event,
+        )
+
+    @staticmethod
+    def _with_runtime_context(message: str, *, enable_ontology: bool) -> str:
+        """Tell the model which request-local pipeline can actually run."""
+        if enable_ontology:
+            pipeline_handoff = (
+                "OntologyAgent -> conditional MetadataAgent -> DataInsightAgent"
+            )
+        else:
+            pipeline_handoff = "MetadataAgent -> DataInsightAgent"
+        return (
+            "<session_runtime>\n"
+            f"ontology_enabled={str(enable_ontology).lower()}\n"
+            f"pipeline_handoff={pipeline_handoff}\n"
+            "This request-local mode is authoritative for progress narration and delegation.\n"
+            "</session_runtime>\n\n"
+            "<original_user_message>\n"
+            f"{message}\n"
+            "</original_user_message>"
         )
 
     def _record_tool_outcome(
@@ -507,7 +527,7 @@ Sub-questions:"""
                     name="QueryDecompositionAgent",
                     instructions="Decompose the supplied question exactly as requested.",
                     tools=[],
-                    temperature=0.1,
+                    reasoning_effort=AgentReasoningConfig.MASTER,
                 )
                 response = asyncio.run(run_agent(decomposition_agent, decomposition_prompt))
                 subqueries_text = response.text
@@ -1868,7 +1888,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             name="MasterAgent",
             instructions=enhanced_prompt,
             tools=tools,
-            temperature=0.1,
+            reasoning_effort=AgentReasoningConfig.MASTER,
         )
         logger.info("MasterAgent created with MAF OpenAIChatCompletionClient")
         return agent
@@ -1912,7 +1932,11 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         token = context_var.set(turn)
 
         try:
-            result = await run_agent(self.agent, message, session=thread)
+            contextual_message = self._with_runtime_context(
+                message,
+                enable_ontology=turn.enable_ontology,
+            )
+            result = await run_agent(self.agent, contextual_message, session=thread)
         finally:
             context_var.reset(token)
 
@@ -1955,7 +1979,15 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
         token = context_var.set(turn)
 
         try:
-            response_stream = stream_agent(self.agent, message, session=thread)
+            contextual_message = self._with_runtime_context(
+                message,
+                enable_ontology=turn.enable_ontology,
+            )
+            response_stream = stream_agent(
+                self.agent,
+                contextual_message,
+                session=thread,
+            )
             async for update in response_stream:
                 yield update
         finally:

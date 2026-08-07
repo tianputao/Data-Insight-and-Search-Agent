@@ -187,7 +187,7 @@ class MetadataCatalogService:
             for table in details
         }
         aliases: dict[str, dict[str, Any]] = {}
-        unverified_aliases: set[str] = set()
+        unusable_aliases: set[str] = set()
         table_pattern = re.compile(
             r"(?is)\b(?:FROM|JOIN)\s+([`A-Za-z0-9_.]+)"
             r"(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?"
@@ -202,14 +202,26 @@ class MetadataCatalogService:
                 tables_by_full_name.get(full_name.casefold())
                 or tables_by_name.get(bare_name.casefold())
             )
+            alias_key = possible_alias.casefold()
             if table is None:
-                unverified_aliases.add(possible_alias.casefold())
+                unusable_aliases.add(alias_key)
                 continue
-            aliases[possible_alias.casefold()] = table
+            bound = aliases.get(alias_key)
+            # CTEs and subqueries can rebind one alias to different tables; this
+            # regex pass has no scope, so an ambiguous alias must never be rewritten.
+            if bound is not None and bound["full_name"] != table["full_name"]:
+                unusable_aliases.add(alias_key)
+                continue
+            aliases[alias_key] = table
 
-        for alias in unverified_aliases:
+        for alias in unusable_aliases:
             aliases.pop(alias, None)
 
+        verified_columns = {
+            column["name"].casefold()
+            for table in details
+            for column in table["columns"]
+        }
         corrections: list[dict[str, str]] = []
 
         def replace_identifier(match: re.Match[str]) -> str:
@@ -229,6 +241,10 @@ class MetadataCatalogService:
             )
             if exact:
                 return f"{alias}.{exact}"
+
+            # A name that really exists elsewhere signals a wrong alias, not a typo.
+            if requested.casefold() in verified_columns:
+                return match.group(0)
 
             resolved = self._resolve_column_name(requested, columns)
             if resolved is None:

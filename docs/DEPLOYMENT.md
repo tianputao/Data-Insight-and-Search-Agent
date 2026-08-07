@@ -7,8 +7,6 @@ This guide covers deploying the Enterprise Agentic RAG Chatbot to production. Th
 - **FastAPI backend** (`src/api/main.py`) — Python, serves SSE streaming and REST endpoints
 - **React frontend** (`frontend/`) — TypeScript/Vite, communicates with the backend over HTTP
 
-Additionally, the standalone **Streamlit UI** (`app.py`) can be deployed independently for simple RAG-only access (no Databricks agents).
-
 ## 📋 Pre-Deployment Checklist
 
 ### Azure Resources
@@ -27,6 +25,7 @@ Additionally, the standalone **Streamlit UI** (`app.py`) can be deployed indepen
 - [ ] Python 3.10+ and Node.js 18+ available on deployment target
 - [ ] All Python and Node.js dependencies installable
 - [ ] `logs/`, `tmp/`, `data/` directories writable
+- [ ] `data/business_layer.md` persisted on durable storage if the business layer document must survive redeploys (it is git-ignored and node-local)
 - [ ] Network connectivity to all Azure services verified
 - [ ] Security review of SAS token expiry dates
 
@@ -186,21 +185,6 @@ az containerapp create \
   --image <your-acr>.azurecr.io/agentic-rag-frontend:latest \
   --target-port 80 \
   --ingress external
-```
-
-### Option 3: Standalone Streamlit (RAG only)
-
-For minimal deployments that do not require Databricks agents:
-
-```bash
-# Dockerfile.streamlit
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-EXPOSE 8501
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
 ```
 
 ## 🔐 Security Hardening
@@ -375,7 +359,7 @@ Use App Service deployment slots or separate resources per environment:
 ## 📝 Post-Deployment Tasks
 
 1. **Verify functionality**: Test each question type (RAG, data insight, metadata)
-2. **Check skill loading**: `GET /skills` returns `analytics-spec`, `ontology-sql-planning`, and `metadata-mapping`
+2. **Check skill loading**: `GET /skills` returns `analytics-spec`, `sql-planning`, and `metadata-mapping`
 3. **Monitor logs**: `az webapp log tail --resource-group <your-rg> --name <your-app-name>`
 4. **Set up Azure Monitor alerts**
 5. **Document internal service endpoints** for the team

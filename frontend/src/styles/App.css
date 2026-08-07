@@ -308,9 +308,9 @@
   box-sizing: border-box;
 }
 
-/* ── Compact markdown spacing inside assistant bubbles ── */
+/* ── Markdown spacing inside assistant bubbles ── */
 .message.assistant p {
-  margin: 0 0 6px 0;
+  margin: 0 0 8px 0;
 }
 .message.assistant p:last-child {
   margin-bottom: 0;
@@ -319,16 +319,31 @@
 .message.assistant h2,
 .message.assistant h3,
 .message.assistant h4 {
-  margin: 10px 0 4px 0;
-  font-size: 1em;
+  margin: 22px 0 8px 0;
+  font-size: 1.06em;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.message.assistant > :first-child {
+  margin-top: 0;
 }
 .message.assistant ul,
 .message.assistant ol {
-  margin: 4px 0;
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.message.assistant ul ul,
+.message.assistant ul ol,
+.message.assistant ol ul,
+.message.assistant ol ol {
+  margin: 4px 0 6px 0;
   padding-left: 20px;
 }
 .message.assistant li {
-  margin: 2px 0;
+  margin: 4px 0;
+}
+.message.assistant li > p {
+  margin: 0 0 4px 0;
 }
 .message.assistant blockquote {
   margin: 6px 0;
@@ -338,7 +353,7 @@
 }
 .message.assistant table {
   border-collapse: collapse;
-  margin: 8px 0;
+  margin: 10px 0 12px 0;
   font-size: 13px;
   width: 100%;
 }
@@ -609,11 +624,16 @@
 
 .agent-activity-task {
   margin: 7px 0;
+  padding: 8px;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--bg-primary);
+  border-radius: 4px;
   color: var(--text-muted);
   font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .activity-tool,

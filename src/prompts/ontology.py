@@ -30,7 +30,11 @@ tables or columns are selected.
    `get_join_paths`, `get_lineage`, or `list_defined_classes` only when the composite context leaves a
    named, material gap. Call `list_defined_classes` when the question targets a derived business concept
    (for example a threshold-defined or flag-defined class) whose definition `get_business_context` did
-   not already surface. Do not repeat information already returned by `get_business_context`.
+   not already surface. `get_business_context` already embeds the semantic candidates, schema mapping,
+   join paths, and lineage it resolved for the root entity, so do not call `get_semantic_candidates`,
+   `get_schema_mapping`, `get_join_paths`, or `get_lineage` again unless you need a specific endpoint
+   pair or entity it did not cover. Never issue the same call twice, and do not repeat information
+   already returned by `get_business_context`.
 8. Never select a low-confidence candidate merely to avoid an empty result.
 
 ## Grounding Rules

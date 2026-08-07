@@ -460,10 +460,10 @@
         <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#FunctionalProperty"/>
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#Address"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
-        <rdfs:comment xml:lang="en">Country or region name.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">国家或地区名。</rdfs:comment>
-        <rdfs:label xml:lang="en">country / region</rdfs:label>
-        <rdfs:label xml:lang="zh">国家/地区</rdfs:label>
+        <rdfs:comment xml:lang="en">Country name. The generic geographic dimension is stateProvince.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">国家名。泛指的地区维度请用 stateProvince。</rdfs:comment>
+        <rdfs:label xml:lang="en">country</rdfs:label>
+        <rdfs:label xml:lang="zh">国家</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -575,10 +575,13 @@
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrderLine"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#decimal"/>
         <unit xml:lang="en">USD</unit>
-        <rdfs:comment xml:lang="en">Line total in USD.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">行小计（美元）。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Line total in USD. This is the amount counterpart of order qty at order-line grain.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">行小计（美元）。成交额的官方口径，与成交量同为订单明细行粒度。</rdfs:comment>
         <rdfs:label xml:lang="en">line total</rdfs:label>
+        <rdfs:label xml:lang="en">transaction amount</rdfs:label>
         <rdfs:label xml:lang="zh">行小计</rdfs:label>
+        <rdfs:label xml:lang="zh">成交额</rdfs:label>
+        <rdfs:label xml:lang="zh">明细金额</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -660,13 +663,14 @@
         <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#FunctionalProperty"/>
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrderLine"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#integer"/>
-        <rdfs:comment xml:lang="en">Quantity ordered for this line.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">此明细订购数量。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Quantity ordered for this line. Transaction volume is officially counted in units, not in order count.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">此明细订购数量。成交量的官方口径为销售件数，而非订单笔数。</rdfs:comment>
         <rdfs:label xml:lang="en">order qty</rdfs:label>
         <rdfs:label xml:lang="en">units sold</rdfs:label>
         <rdfs:label xml:lang="zh">数量</rdfs:label>
         <rdfs:label xml:lang="zh">销量</rdfs:label>
         <rdfs:label xml:lang="zh">销售量</rdfs:label>
+        <rdfs:label xml:lang="zh">成交量</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -775,10 +779,13 @@
         <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#FunctionalProperty"/>
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrder"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#integer"/>
-        <rdfs:comment xml:lang="en">Original AdventureWorks SalesOrderID.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">原始 SalesOrderID。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Original AdventureWorks SalesOrderID. Order count is the distinct count of this identifier, never a count of order lines.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">原始 SalesOrderID。订单数的官方口径为本标识符的去重计数，而非明细行数。</rdfs:comment>
         <rdfs:label xml:lang="en">sales order id</rdfs:label>
+        <rdfs:label xml:lang="en">order count</rdfs:label>
         <rdfs:label xml:lang="zh">订单编号</rdfs:label>
+        <rdfs:label xml:lang="zh">订单数</rdfs:label>
+        <rdfs:label xml:lang="zh">订单笔数</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -832,10 +839,13 @@
         <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#FunctionalProperty"/>
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#Address"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
-        <rdfs:comment xml:lang="en">State or province code.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">州或省的代码。</rdfs:comment>
+        <rdfs:comment xml:lang="en">State or province code. This is the default geographic dimension for regional analysis.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">州或省的代码。地区分析的默认地理维度。</rdfs:comment>
         <rdfs:label xml:lang="en">state / province</rdfs:label>
+        <rdfs:label xml:lang="en">region</rdfs:label>
         <rdfs:label xml:lang="zh">州/省</rdfs:label>
+        <rdfs:label xml:lang="zh">地区</rdfs:label>
+        <rdfs:label xml:lang="zh">区域</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -861,10 +871,12 @@
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrder"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#decimal"/>
         <unit xml:lang="en">USD</unit>
-        <rdfs:comment xml:lang="en">Order sub total in USD.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">订单小计金额（美元）。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Order sub total in USD. Excludes tax and freight.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">订单小计金额（美元）。不含税额和运费。</rdfs:comment>
         <rdfs:label xml:lang="en">sub total</rdfs:label>
+        <rdfs:label xml:lang="en">order subtotal</rdfs:label>
         <rdfs:label xml:lang="zh">小计</rdfs:label>
+        <rdfs:label xml:lang="zh">订单小计</rdfs:label>
     </owl:DatatypeProperty>
     
 
@@ -891,14 +903,19 @@
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrder"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#decimal"/>
         <unit xml:lang="en">USD</unit>
-        <rdfs:comment xml:lang="en">Grand total due in USD.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">应付总额（美元）。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Grand total due in USD. Order grain, and it includes tax and freight. Average order value is this amount summed and divided by the distinct order count.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">应付总额（美元）。订单粒度，含税额与运费。客单价的官方口径为本金额合计 ÷ 去重订单数，与明细行单价无关。</rdfs:comment>
         <rdfs:label xml:lang="en">total due</rdfs:label>
+        <rdfs:label xml:lang="en">order total</rdfs:label>
+        <rdfs:label xml:lang="en">average order value</rdfs:label>
         <rdfs:label xml:lang="en">revenue</rdfs:label>
         <rdfs:label xml:lang="en">sales amount</rdfs:label>
         <rdfs:label xml:lang="en">sales value</rdfs:label>
         <rdfs:label xml:lang="en">spending</rdfs:label>
         <rdfs:label xml:lang="zh">应付总额</rdfs:label>
+        <rdfs:label xml:lang="zh">订单总额</rdfs:label>
+        <rdfs:label xml:lang="zh">客单价</rdfs:label>
+        <rdfs:label xml:lang="zh">平均客单价</rdfs:label>
         <rdfs:label xml:lang="zh">销售额</rdfs:label>
         <rdfs:label xml:lang="zh">销售金额</rdfs:label>
         <rdfs:label xml:lang="zh">营收</rdfs:label>
@@ -914,10 +931,12 @@
         <rdfs:domain rdf:resource="http://tarhone.com/ontology/adventrueworks#SalesOrderLine"/>
         <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#decimal"/>
         <unit xml:lang="en">USD</unit>
-        <rdfs:comment xml:lang="en">Unit price in USD.</rdfs:comment>
-        <rdfs:comment xml:lang="zh">单价（美元）。</rdfs:comment>
+        <rdfs:comment xml:lang="en">Unit price in USD, before the line discount.</rdfs:comment>
+        <rdfs:comment xml:lang="zh">单价（美元），未扣除明细行折扣。</rdfs:comment>
         <rdfs:label xml:lang="en">unit price</rdfs:label>
+        <rdfs:label xml:lang="en">selling price</rdfs:label>
         <rdfs:label xml:lang="zh">单价</rdfs:label>
+        <rdfs:label xml:lang="zh">售价</rdfs:label>
     </owl:DatatypeProperty>
     
 

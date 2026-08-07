@@ -59,7 +59,7 @@ def create_agent(
     name: str,
     instructions: str,
     tools: Sequence[Any],
-    temperature: float,
+    reasoning_effort: str,
     context_providers: Optional[Sequence[ContextProvider]] = None,
     model: Optional[str] = None,
     max_iterations: Optional[int] = None,
@@ -67,9 +67,13 @@ def create_agent(
 ) -> Agent:
     """Create a MAF Agent while keeping construction consistent across sub-agents."""
     selected_model = model or AzureOpenAIConfig.GPT_DEPLOYMENT
+    resolved_tools = list(tools)
     default_options: dict[str, Any] = {}
-    if not selected_model.strip().lower().startswith("gpt-5"):
-        default_options["temperature"] = temperature
+    # gpt-5 rejects temperature/top_p and exposes reasoning_effort, but Chat Completions
+    # refuses reasoning_effort whenever function tools are present; that combination needs
+    # the Responses API, which this client does not use.
+    if selected_model.strip().lower().startswith("gpt-5") and not resolved_tools:
+        default_options["reasoning_effort"] = reasoning_effort
     return create_chat_client(
         model=selected_model,
         max_iterations=max_iterations,
@@ -77,7 +81,7 @@ def create_agent(
     ).as_agent(
         name=name,
         instructions=instructions,
-        tools=list(tools),
+        tools=resolved_tools,
         context_providers=list(context_providers or []),
         default_options=default_options,
     )

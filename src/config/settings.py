@@ -41,6 +41,30 @@ class AzureOpenAIConfig:
     EMBEDDING_DIMENSIONS = int(os.getenv('AZURE_OPENAI_EMBEDDING_DIMENSIONS', '3072'))
 
 
+_REASONING_EFFORTS = ('none', 'low', 'medium', 'high')
+
+
+def _read_reasoning_effort(name: str, default: str = 'medium') -> str:
+    value = os.getenv(name, default).strip().lower()
+    return value if value in _REASONING_EFFORTS else default
+
+
+class AgentReasoningConfig:
+    """Per-agent reasoning effort.
+
+    `gpt-5*` deployments reject `temperature` and `top_p` outright and expose
+    `reasoning_effort` instead; `maf_runtime.create_agent` sends this only to those models.
+    """
+
+    ALLOWED = _REASONING_EFFORTS
+
+    MASTER = _read_reasoning_effort('MASTER_AGENT_REASONING_EFFORT')
+    ONTOLOGY = _read_reasoning_effort('ONTOLOGY_AGENT_REASONING_EFFORT')
+    METADATA = _read_reasoning_effort('METADATA_AGENT_REASONING_EFFORT')
+    DATA_INSIGHT = _read_reasoning_effort('DATA_INSIGHT_AGENT_REASONING_EFFORT')
+    SEARCH = _read_reasoning_effort('SEARCH_AGENT_REASONING_EFFORT')
+
+
 class AzureSearchConfig:
     """Azure AI Search service configuration - Matches index-dev-figure-01-chunk schema."""
     
@@ -202,6 +226,8 @@ class OntologyConfig:
         1,
         int(os.getenv('ONTOLOGY_AGENT_MAX_FUNCTION_CALLS', '6')),
     )
+    # Optional safety net for handed-off evidence size. 0 disables any size-based dropping.
+    CONTEXT_MAX_CHARS = max(0, int(os.getenv('ONTOLOGY_CONTEXT_MAX_CHARS', '0')))
 
 
 class AppConfig:

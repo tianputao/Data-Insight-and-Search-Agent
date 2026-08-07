@@ -1,6 +1,7 @@
 """Configuration package."""
 
 from .settings import (
+    AgentReasoningConfig,
     AzureOpenAIConfig,
     AzureSearchConfig,
     AzureAIFoundryConfig,
@@ -13,6 +14,7 @@ from .settings import (
 )
 
 __all__ = [
+    'AgentReasoningConfig',
     'AzureOpenAIConfig',
     'AzureSearchConfig',
     'AzureAIFoundryConfig',

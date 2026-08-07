@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
+from decimal import Decimal
 import json
 import re
 import threading
@@ -31,7 +32,7 @@ from pydantic import Field
 from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 
-from ..config import DatabricksConfig, OntologyConfig
+from ..config import AgentReasoningConfig, DatabricksConfig, OntologyConfig
 from ..prompts import DATA_INSIGHT_AGENT_PROMPT
 from ..skills_provider import (
     begin_skill_usage_tracking,
@@ -106,6 +107,242 @@ def _validate_sql_scope(sql: str) -> Optional[str]:
     return None
 
 
+def _extract_sql_measures(sql: str) -> dict[str, Any]:
+    """Report what a query actually aggregated, grouped, and filtered, straight from its AST."""
+    try:
+        statements = [statement for statement in parse(sql, read="databricks") if statement]
+    except ParseError:
+        return {}
+    if not statements:
+        return {}
+    statement = statements[0]
+
+    cte_names = {
+        cte.alias_or_name.casefold()
+        for cte in statement.find_all(exp.CTE)
+        if cte.alias_or_name
+    }
+    tables = sorted(
+        {
+            f"{table.db}.{table.name}" if table.db else table.name
+            for table in statement.find_all(exp.Table)
+            if table.name and table.name.casefold() not in cte_names
+        }
+    )
+
+    alias_bases: dict[str, set[str]] = {}
+    for alias in statement.find_all(exp.Alias):
+        name = alias.alias
+        if not name:
+            continue
+        sources = {column.name for column in alias.find_all(exp.Column) if column.name}
+        alias_bases.setdefault(name, set()).update(sources - {name})
+
+    # Resolve alias-of-alias chains so a derived name points at real columns.
+    for _ in range(len(alias_bases) + 1):
+        changed = False
+        for name, sources in list(alias_bases.items()):
+            expanded = set()
+            for source in sources:
+                expanded |= alias_bases.get(source, {source}) if source != name else {source}
+            expanded.discard(name)
+            if expanded != sources:
+                alias_bases[name] = expanded
+                changed = True
+        if not changed:
+            break
+
+    aggregates: set[str] = set()
+    aggregate_columns: set[str] = set()
+    for function in statement.find_all(exp.AggFunc):
+        columns = sorted({column.name for column in function.find_all(exp.Column) if column.name})
+        aggregate_columns.update(columns)
+        distinct = "DISTINCT " if any(function.find_all(exp.Distinct)) else ""
+        aggregates.add(f"{function.sql_name()}({distinct}{', '.join(columns) or '*'})")
+
+    def column_names(node_type: Any) -> list[str]:
+        return sorted(
+            {
+                column.name
+                for node in statement.find_all(node_type)
+                for column in node.find_all(exp.Column)
+                if column.name
+            }
+        )
+
+    group_by = column_names(exp.Group)
+    filter_columns = column_names(exp.Where)
+    referenced = set(group_by) | set(filter_columns) | aggregate_columns
+    derived = {
+        name: sorted(sources)
+        for name, sources in alias_bases.items()
+        if name in referenced and sources
+    }
+
+    return {
+        "tables": tables,
+        "aggregates": sorted(aggregates),
+        "group_by": group_by,
+        "filter_columns": filter_columns,
+        "derived_names": derived,
+    }
+
+
+_COMPARISON_COLUMN_PATTERN = re.compile(
+    r"(?:difference|diff|delta|variance|gap|change|uplift|差异|差额|变化|增减)",
+    re.IGNORECASE,
+)
+_IDENTIFIER_COLUMN_PATTERN = re.compile(
+    r"(?:^|_)(?:id|key|code|rank|index|number)(?:$|_)|"
+    r"(?:id|key|code|rank|index|number)$|(?:编号|代码|排名)$",
+    re.IGNORECASE,
+)
+_MULTI_OBSERVATION_PATTERN = re.compile(
+    r"(?:compare|comparison|difference|trend|distribution|breakdown|across|"
+    r"\bby\b|monthly|daily|weekly|yearly|top\s*\d+|analy[sz]e|"
+    r"比较|差异|趋势|分布|拆分|前\s*\d+|分别|各(?:个|类|地区|月|年)|按[^\s]{0,12}(?:统计|汇总|地区|月|年|类别|产品))",
+    re.IGNORECASE,
+)
+
+
+def _profile_query_result(
+    columns: list[str],
+    rows: list[list[Any]],
+    *,
+    question: str = "",
+    minimum_sample_rows: int = 3,
+) -> dict[str, Any]:
+    """Detect result shapes that cannot support a confident analytical conclusion."""
+
+    row_count = len(rows)
+    expects_multiple = bool(_MULTI_OBSERVATION_PATTERN.search(question or ""))
+    signals: list[dict[str, Any]] = []
+    if row_count == 0:
+        signals.append({"code": "empty_result", "row_count": 0})
+
+    def is_number(value: Any) -> bool:
+        return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+    numeric_values: dict[str, list[Any]] = {}
+    for index, column in enumerate(columns):
+        values = [
+            row[index]
+            for row in rows
+            if index < len(row) and row[index] is not None and is_number(row[index])
+        ]
+        if values and not _IDENTIFIER_COLUMN_PATTERN.search(str(column)):
+            numeric_values[str(column)] = values
+
+    comparison_columns = [
+        column
+        for column in numeric_values
+        if _COMPARISON_COLUMN_PATTERN.search(column)
+    ]
+    all_comparison_values_zero = bool(comparison_columns) and all(
+        all(value == 0 for value in numeric_values[column])
+        for column in comparison_columns
+    )
+    if all_comparison_values_zero:
+        signals.append(
+            {
+                "code": "all_comparison_values_zero",
+                "columns": comparison_columns,
+            }
+        )
+
+    non_comparison_columns = [
+        column for column in numeric_values if column not in comparison_columns
+    ]
+    identical_column_pairs: list[list[str]] = []
+    column_indexes = {str(column): index for index, column in enumerate(columns)}
+    for left_index, left in enumerate(non_comparison_columns):
+        for right in non_comparison_columns[left_index + 1 :]:
+            left_position = column_indexes[left]
+            right_position = column_indexes[right]
+            comparable = [
+                (row[left_position], row[right_position])
+                for row in rows
+                if left_position < len(row)
+                and right_position < len(row)
+                and row[left_position] is not None
+                and row[right_position] is not None
+                and is_number(row[left_position])
+                and is_number(row[right_position])
+            ]
+            if len(comparable) >= 2 and all(
+                left_value == right_value
+                for left_value, right_value in comparable
+            ):
+                identical_column_pairs.append([left, right])
+    if identical_column_pairs:
+        signals.append(
+            {
+                "code": "identical_measure_columns",
+                "pairs": identical_column_pairs,
+            }
+        )
+
+    all_numeric_values_zero = bool(numeric_values) and all(
+        all(value == 0 for value in values)
+        for values in numeric_values.values()
+    )
+    if all_numeric_values_zero:
+        signals.append(
+            {
+                "code": "all_numeric_values_zero",
+                "columns": list(numeric_values),
+            }
+        )
+
+    constant_measure_columns = [
+        column
+        for column, values in numeric_values.items()
+        if row_count > 1 and len(set(values)) == 1
+    ]
+    if expects_multiple and constant_measure_columns:
+        signals.append(
+            {
+                "code": "constant_measure_columns",
+                "columns": constant_measure_columns,
+            }
+        )
+
+    low_sample = 0 < row_count < max(1, minimum_sample_rows)
+    if expects_multiple and low_sample:
+        signals.append(
+            {
+                "code": "low_sample",
+                "row_count": row_count,
+                "expected_minimum": minimum_sample_rows,
+            }
+        )
+
+    hard_signal_codes = {
+        "empty_result",
+        "all_comparison_values_zero",
+        "identical_measure_columns",
+        "all_numeric_values_zero",
+    }
+    requires_follow_up = any(
+        signal["code"] in hard_signal_codes for signal in signals
+    ) or (
+        expects_multiple
+        and any(
+            signal["code"] in {"constant_measure_columns", "low_sample"}
+            for signal in signals
+        )
+    )
+    return {
+        "row_count": row_count,
+        "expects_multiple_observations": expects_multiple,
+        "numeric_measure_columns": list(numeric_values),
+        "comparison_columns": comparison_columns,
+        "identical_column_pairs": identical_column_pairs,
+        "signals": signals,
+        "requires_follow_up": requires_follow_up,
+    }
+
+
 @dataclass
 class _RecoveryState:
     question: str
@@ -116,6 +353,8 @@ class _RecoveryState:
     governed_skill_context: str = ""
     metadata_attempts: int = 0
     ontology_attempts: int = 0
+    diagnostic_attempts: int = 0
+    pending_diagnostic: Optional[dict[str, Any]] = None
 
 
 def _get_db_connection():
@@ -247,6 +486,20 @@ class DataInsightAgent:
         )
 
     @staticmethod
+    def _diagnostic_follow_up_message(state: _RecoveryState) -> str:
+        return (
+            "<mandatory_result_diagnostic>\n"
+            "The previous SQL result was analytically degenerate and the first response "
+            "must not be finalized. Using the ontology and verified schema already in this "
+            "session, execute exactly one focused source-level SQL query with "
+            "purpose=\"diagnostic\". Distinguish source equality, aggregation/grain "
+            "collapse, null or mapping gaps, low cardinality, and period/sample coverage. "
+            "Then provide one revised final answer grounded in both query results.\n"
+            f"signals={json.dumps(state.pending_diagnostic or {}, ensure_ascii=False)}\n"
+            "</mandatory_result_diagnostic>"
+        )
+
+    @staticmethod
     def _original_question(question: str) -> str:
         match = re.search(
             r"(?is)<original_user_question>\s*(.*?)\s*</original_user_question>",
@@ -357,6 +610,42 @@ class DataInsightAgent:
             context_blocks.append(
                 f"<ontology_fallback>\n{ontology_fallback}\n</ontology_fallback>"
             )
+        if governed_skill_context:
+            try:
+                governed_name = str(
+                    json.loads(governed_skill_context).get("skill_name") or ""
+                ).strip()
+            except (TypeError, json.JSONDecodeError, AttributeError):
+                governed_name = ""
+            definition_source = (
+                "skill_contract\n"
+                "Definitions come from the governed Skill resource.\n"
+                "allowed_source_labels=用户指定 / User-stated | "
+                f"Skill: {governed_name or 'governed template'} | "
+                "系统默认 / System default | 推断 / Inferred"
+            )
+        elif ontology_enabled:
+            definition_source = (
+                "available\n"
+                "Business meaning comes from the active ontology. MetadataAgent ran in verification "
+                "mode without the metadata-mapping glossary, so that Skill is not a valid source "
+                "here.\n"
+                "allowed_source_labels=用户指定 / User-stated | 本体 / Ontology | "
+                "Skill: sql-planning | 系统默认 / System default | 推断 / Inferred"
+            )
+        else:
+            definition_source = (
+                "unavailable\n"
+                "No ontology is active, so business meaning came from the loaded Skills, the "
+                "deterministic rules in your instructions, or your own choice.\n"
+                "allowed_source_labels=用户指定 / User-stated | Skill: metadata-mapping | "
+                "Skill: sql-planning | 系统默认 / System default | 推断 / Inferred"
+            )
+        context_blocks.append(
+            "<definition_provenance>\n"
+            f"governed_definitions={definition_source}\n"
+            "</definition_provenance>"
+        )
         if governed_skill_context:
             context_blocks.append(
                 "<governed_skill_context>\n"
@@ -556,16 +845,54 @@ class DataInsightAgent:
                 int,
                 Field(description="Maximum number of rows to return (default 100, max 500)"),
             ] = 100,
+            purpose: Annotated[
+                str,
+                Field(
+                    description=(
+                        "Use 'analysis' for the requested result or 'diagnostic' for the one "
+                        "required follow-up after a degenerate result"
+                    )
+                ),
+            ] = "analysis",
         ) -> str:
             """
             Execute the provided SQL query against Azure Databricks and return the results.
             Only SELECT statements are permitted. Always use fully-qualified table names
             (catalog.schema.table).
             """
-            logger.info(f"[Tool:execute_sql] Executing SQL (max_rows={max_rows}):\n{sql}")
+            logger.info(
+                "[Tool:execute_sql] Executing SQL (purpose=%s, max_rows=%s):\n%s",
+                purpose,
+                max_rows,
+                sql,
+            )
 
             state = self._recovery_state.get()
-            required_skill = "ontology-sql-planning"
+            normalized_purpose = str(purpose or "analysis").strip().lower()
+            if normalized_purpose not in {"analysis", "diagnostic"}:
+                return "BLOCKED: purpose must be either 'analysis' or 'diagnostic'."
+            if (
+                state is not None
+                and state.pending_diagnostic is not None
+                and normalized_purpose != "diagnostic"
+            ):
+                return (
+                    "BLOCKED: The previous result was analytically degenerate. Execute one "
+                    "focused source-level query with purpose='diagnostic' before finalizing."
+                )
+            if (
+                state is not None
+                and normalized_purpose == "diagnostic"
+                and state.diagnostic_attempts >= 1
+            ):
+                return "BLOCKED: The one allowed diagnostic SQL query was already executed."
+            if (
+                state is not None
+                and normalized_purpose == "diagnostic"
+                and state.pending_diagnostic is None
+            ):
+                return "BLOCKED: No degenerate result is awaiting a diagnostic query."
+            required_skill = "sql-planning"
             required_resource = ""
             if state is not None and state.governed_skill_context:
                 try:
@@ -653,6 +980,7 @@ class DataInsightAgent:
                             corrections,
                         )
                 try:
+                    executed_sql = active_sql
                     result = _run_databricks_query(active_sql, max_rows=max_rows)
                 except Exception as first_exc:
                     msg = str(first_exc)
@@ -663,6 +991,7 @@ class DataInsightAgent:
                                 "[Tool:execute_sql] Retrying after rewriting unsupported QUALIFY aggregate pattern."
                             )
                             logger.info(f"[Tool:execute_sql] Rewritten SQL:\n{rewritten}")
+                            executed_sql = rewritten
                             result = _run_databricks_query(rewritten, max_rows=max_rows)
                         else:
                             raise
@@ -672,9 +1001,50 @@ class DataInsightAgent:
                 columns = result["columns"]
                 rows = result["rows"]
                 row_count = result["row_count"]
+                diagnostics = _profile_query_result(
+                    [str(column) for column in columns],
+                    rows,
+                    question=state.question if state is not None else "",
+                )
+                if state is not None and normalized_purpose == "diagnostic":
+                    state.diagnostic_attempts += 1
+                    state.pending_diagnostic = None
+                    diagnostics["requires_follow_up"] = False
+                    diagnostics["diagnostic_completed"] = True
+                elif diagnostics["requires_follow_up"]:
+                    diagnostics["diagnostic_completed"] = False
+                    if state is not None and state.diagnostic_attempts < 1:
+                        state.pending_diagnostic = diagnostics
+                    elif state is not None:
+                        diagnostics["requires_follow_up"] = False
+                        diagnostics["diagnostic_limit_reached"] = True
+                diagnostics["next_action"] = (
+                    "Execute exactly one focused source-level SQL query with "
+                    "purpose='diagnostic' before answering. Distinguish source-grain "
+                    "equality, aggregation/grain collapse, null or coverage gaps, and "
+                    "insufficient sample coverage using the verified schema."
+                    if diagnostics["requires_follow_up"]
+                    else "Interpret the measured result without inventing unsupported causes."
+                )
+                diagnostic_block = (
+                    "\n\n<result_diagnostics>\n"
+                    + json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":"))
+                    + "\n</result_diagnostics>"
+                )
+                measures = _extract_sql_measures(executed_sql)
+                if measures:
+                    measures["note"] = (
+                        "Extracted from the executed SQL. Any statement about which columns, "
+                        "grain, or filters produced these numbers must match this block."
+                    )
+                    diagnostic_block += (
+                        "\n\n<measures_used>\n"
+                        + json.dumps(measures, ensure_ascii=False, separators=(",", ":"))
+                        + "\n</measures_used>"
+                    )
 
                 if not rows:
-                    return f"Query returned 0 rows."
+                    return f"Query returned 0 rows.{diagnostic_block}"
 
                 # Build markdown table for small results
                 if row_count <= 20:
@@ -686,7 +1056,7 @@ class DataInsightAgent:
                     table = "\n".join([header, separator] + body_lines)
                     # Note: SQL is intentionally excluded here — it is already shown
                     # in the thinking panel via the execute_sql thinking event.
-                    return f"Query returned {row_count} row(s).\n\n{table}"
+                    return f"Query returned {row_count} row(s).\n\n{table}{diagnostic_block}"
                 else:
                     # Summarise large results as JSON (no SQL block — shown in thinking)
                     summary = json.dumps(
@@ -696,7 +1066,7 @@ class DataInsightAgent:
                     )
                     return (
                         f"Query returned {row_count} row(s) (showing first 5 of {row_count}).\n\n"
-                        f"```json\n{summary}\n```"
+                        f"```json\n{summary}\n```{diagnostic_block}"
                     )
 
             except RuntimeError as exc:
@@ -737,7 +1107,9 @@ class DataInsightAgent:
             name="DataInsightAgent",
             instructions=enriched_prompt,
             tools=tools,
-            temperature=0.6,
+            # This agent chooses the metric, grain, dimension level, and time window; sampling
+            # variance here makes the same question return a different 口径 on every run.
+            reasoning_effort=AgentReasoningConfig.DATA_INSIGHT,
             context_providers=[skills_provider] if skills_provider else None,
         )
         logger.info("DataInsightAgent created with MAF OpenAIChatCompletionClient.")
@@ -788,7 +1160,18 @@ class DataInsightAgent:
         token = self._recovery_state.set(state)
         skill_token = begin_skill_usage_tracking()
         try:
-            result = await run_agent(self.agent, full_question, session=thread)
+            active_session = thread or self.get_new_thread()
+            result = await run_agent(
+                self.agent,
+                full_question,
+                session=active_session,
+            )
+            if state.pending_diagnostic is not None:
+                result = await run_agent(
+                    self.agent,
+                    self._diagnostic_follow_up_message(state),
+                    session=active_session,
+                )
             logger.info(f"DataInsightAgent.query completed, len={len(result.text)}")
             return result.text
         finally:
@@ -823,12 +1206,20 @@ class DataInsightAgent:
         token = self._recovery_state.set(state)
         skill_token = begin_skill_usage_tracking()
         try:
+            active_session = thread or self.get_new_thread()
             async for update in stream_agent(
                 self.agent,
                 full_question,
-                session=thread,
+                session=active_session,
             ):
                 yield update
+            if state.pending_diagnostic is not None:
+                async for update in stream_agent(
+                    self.agent,
+                    self._diagnostic_follow_up_message(state),
+                    session=active_session,
+                ):
+                    yield update
         finally:
             reset_skill_usage_tracking(skill_token)
             self._recovery_state.reset(token)

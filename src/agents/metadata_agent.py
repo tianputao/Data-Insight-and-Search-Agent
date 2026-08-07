@@ -25,7 +25,7 @@ from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
 
-from ..config import AzureOpenAIConfig, DatabricksConfig
+from ..config import AgentReasoningConfig, AzureOpenAIConfig, DatabricksConfig
 from ..metadata_catalog import MetadataCatalogService
 from ..prompts import METADATA_AGENT_PROMPT
 from ..skills_provider import create_skills_provider
@@ -547,7 +547,7 @@ class MetadataAgent:
             name=name,
             instructions=enriched_prompt,
             tools=tools,
-            temperature=0.0,
+            reasoning_effort=AgentReasoningConfig.METADATA,
             context_providers=[skills_provider] if skills_provider else None,
             model=AzureOpenAIConfig.SMALL_GPT_DEPLOYMENT,
             max_iterations=DatabricksConfig.METADATA_AGENT_MAX_MODEL_ROUNDTRIPS,
@@ -620,16 +620,139 @@ class MetadataAgent:
             if isinstance(data.get("schema_mapping"), dict)
             else {}
         )
+        semantic_properties = [
+            item
+            for item in data.get("semantic_properties", [])
+            if isinstance(item, dict)
+        ]
+        join_paths = [
+            item for item in data.get("join_paths", []) if isinstance(item, dict)
+        ]
+
+        root_entity = data.get("root_entity")
+        root_name = (
+            root_entity.get("name")
+            if isinstance(root_entity, dict)
+            else root_entity
+        )
+        required_entities: list[str] = []
+        entity_reasons: dict[str, set[str]] = {}
+
+        def require_entity(entity: Any, reason: str) -> None:
+            name = str(entity or "").strip()
+            if not name:
+                return
+            if name not in entity_reasons:
+                required_entities.append(name)
+                entity_reasons[name] = set()
+            entity_reasons[name].add(reason)
+
+        require_entity(root_name, "root")
+        required_relations: list[dict[str, str]] = []
+        seen_relations: set[tuple[str, str, str]] = set()
+        for path in join_paths:
+            semantic_path = path.get("semantic_path", [])
+            if not isinstance(semantic_path, list):
+                continue
+            entities = semantic_path[0::2]
+            for index, entity in enumerate(entities):
+                reason = (
+                    "path_origin"
+                    if index == 0
+                    else "path_endpoint"
+                    if index == len(entities) - 1
+                    else "path_intermediate"
+                )
+                require_entity(entity, reason)
+            for index in range(0, len(semantic_path) - 2, 2):
+                relation = {
+                    "source": str(semantic_path[index]),
+                    "relation": str(semantic_path[index + 1]),
+                    "target": str(semantic_path[index + 2]),
+                }
+                relation_key = (
+                    relation["source"],
+                    relation["relation"],
+                    relation["target"],
+                )
+                if relation_key not in seen_relations:
+                    seen_relations.add(relation_key)
+                    required_relations.append(relation)
+
+        for item in data.get("hierarchy_relations", []):
+            if not isinstance(item, dict):
+                continue
+            entity_name = str(item.get("entity") or "").strip()
+            relation_name = str(item.get("relation") or "").strip()
+            if not entity_name or not relation_name:
+                continue
+            relation_key = (entity_name, relation_name, entity_name)
+            if relation_key in seen_relations:
+                continue
+            seen_relations.add(relation_key)
+            require_entity(entity_name, "recursive_hierarchy")
+            required_relations.append(
+                {
+                    "source": entity_name,
+                    "relation": relation_name,
+                    "target": entity_name,
+                    "recursive": True,
+                }
+            )
+
+        properties_by_entity: dict[str, list[dict[str, Any]]] = {}
+        for item in semantic_properties:
+            domain = item.get("domain", [])
+            declared_domains = []
+            if isinstance(domain, list):
+                declared_domains = [
+                    value.get("name") if isinstance(value, dict) else value
+                    for value in domain
+                ]
+            property_entities = [
+                str(value or "").strip()
+                for value in declared_domains or [item.get("entity")]
+                if str(value or "").strip()
+            ]
+            try:
+                relevance = float(item.get("relevance") or 0.0)
+            except (TypeError, ValueError):
+                relevance = 0.0
+            for entity_name in property_entities:
+                properties_by_entity.setdefault(entity_name, []).append(item)
+                if item.get("evidence") == "question_match" or relevance > 0:
+                    require_entity(entity_name, "question_match")
+
+        if not required_entities:
+            for entity_name in properties_by_entity:
+                require_entity(entity_name, "ontology_context")
+
+        semantic_property_groups = [
+            {
+                "entity": entity_name,
+                "reasons": sorted(entity_reasons[entity_name]),
+                "properties": properties_by_entity.get(entity_name, []),
+            }
+            for entity_name in required_entities
+        ]
+        root_entity_detail = data.get("root_entity_detail")
+        if isinstance(root_entity_detail, dict):
+            root_entity_detail = {
+                key: value
+                for key, value in root_entity_detail.items()
+                if key != "properties"
+            }
         projection = {
             "status": primary.get("status", collected.get("status", "unknown")),
-            "root_entity": data.get("root_entity"),
-            "root_entity_detail": data.get("root_entity_detail"),
+            "root_entity": root_entity,
+            "root_entity_detail": root_entity_detail,
             "filters": data.get("filters", [])[:10],
-            "semantic_properties": data.get("semantic_properties", [])[:20],
+            "semantic_property_groups": semantic_property_groups,
+            "required_relations": required_relations,
             "semantic_relationships": data.get(
                 "semantic_relationships", []
             )[:12],
-            "join_paths": data.get("join_paths", [])[:8],
+            "join_paths": join_paths,
             "candidate_tables": schema_mapping.get("candidate_tables", [])[:12],
             "candidate_columns": schema_mapping.get("candidate_columns", [])[:30],
             "entity_candidates": data.get("entity_candidates", [])[:8],

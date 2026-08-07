@@ -6,7 +6,6 @@
 #   ./run.sh            Start the full stack (FastAPI + React)
 #   ./run.sh backend    Start only the FastAPI backend
 #   ./run.sh frontend   Start only the React frontend
-#   ./run.sh streamlit  Start the standalone Streamlit UI (RAG only)
 #   ./run.sh install    Install Python and Node.js dependencies
 # ============================================================
 
@@ -137,20 +136,6 @@ start_frontend() {
   cd "${FRONTEND_DIR}"
   export VITE_API_BASE_URL="/api"
   exec npm run dev -- --port "${FRONTEND_PORT}" --strictPort
-}
-
-start_streamlit() {
-  info "Starting standalone Streamlit UI (RAG/search only)…"
-  cd "${PROJECT_ROOT}"
-  activate_venv
-  check_env
-
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
-  set +a
-
-  exec streamlit run app.py --server.port 8501 --server.headless true
 }
 
 start_full_stack() {
@@ -290,9 +275,6 @@ case "${MODE}" in
   frontend)
     start_frontend
     ;;
-  streamlit)
-    start_streamlit
-    ;;
   install)
     install_python_deps
     install_node_deps
@@ -302,7 +284,7 @@ case "${MODE}" in
     start_full_stack
     ;;
   *)
-    echo "Usage: $0 [backend|frontend|streamlit|install|full]"
+    echo "Usage: $0 [backend|frontend|install|full]"
     exit 1
     ;;
 esac

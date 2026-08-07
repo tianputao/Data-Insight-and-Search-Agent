@@ -891,17 +891,27 @@ class OntologyService:
             )
 
         root_record, root_score, root_strategy = roots[0]
-        class_records = self._related_class_records(
-            root_record,
-            depth=min(max_depth, self.max_depth),
-        )
         semantic_properties: list[dict[str, Any]] = []
         semantic_relationships: list[dict[str, Any]] = []
         seen_properties: set[str] = set()
-        property_matches = self._search_records(
+        candidate_property_matches = self._search_records(
             question,
             entity_types={"property"},
             limit=self.max_results,
+        )
+        automatic_threshold = max(self.fuzzy_threshold, 0.8)
+        property_matches = [
+            match
+            for match in candidate_property_matches
+            if match[1] >= automatic_threshold
+        ]
+        if not property_matches and candidate_property_matches:
+            property_matches = candidate_property_matches[:1]
+        class_records, join_paths = self._question_driven_subgraph(
+            question,
+            root_record,
+            property_matches,
+            max_depth=min(max_depth, self.max_depth),
         )
         property_relevance = {
             record.iri: score for record, score, _ in property_matches
@@ -928,8 +938,8 @@ class OntologyService:
                 {
                     "name": prop["name"],
                     "entity": domain_record.name if domain_record else root_record.name,
-                    "iri": property_record.iri,
-                    "evidence": "question match and property domain/range",
+                    # No per-property `iri`: it is always `ontology_iri_prefix + name`.
+                    "evidence": "question_match",
                     "relevance": round(relevance, 4),
                     "type": prop.get("type"),
                     "labels": prop.get("labels", []),
@@ -946,46 +956,82 @@ class OntologyService:
                 if prop_iri in seen_properties:
                     continue
                 seen_properties.add(prop_iri)
-                relevance = round(property_relevance.get(prop_iri, 0.0), 4)
-                if relevance <= 0:
-                    continue
-                semantic_property = {
-                    "name": prop["name"],
-                    "entity": class_record.name,
-                    "iri": prop_iri,
-                    "evidence": "property domain/range and ontology name",
-                    "relevance": relevance,
-                    "type": prop.get("type"),
-                    "labels": prop.get("labels", []),
-                    "comments": prop.get("comments", []),
-                    "domain": prop.get("domain", []),
-                    "range": prop.get("range", []),
-                    "characteristics": prop.get("characteristics", []),
-                }
-                semantic_properties.append(semantic_property)
+                semantic_properties.append(
+                    {
+                        "name": prop["name"],
+                        "entity": class_record.name,
+                        "evidence": "class_schema",
+                        "relevance": round(property_relevance.get(prop_iri, 0.0), 4),
+                        "type": prop.get("type"),
+                        "labels": prop.get("labels", []),
+                        "comments": prop.get("comments", []),
+                        "domain": prop.get("domain", []),
+                        "range": prop.get("range", []),
+                        "characteristics": prop.get("characteristics", []),
+                    }
+                )
 
-        for edge in self._adjacency.get(root_record.iri, []):
-            target_record = self._records_by_iri.get(edge["to"])
-            if target_record and target_record.kind == "class":
+        seen_relationships: set[tuple[str, str, str]] = set()
+        for path in join_paths:
+            for edge in path.get("semantic_edges", []):
+                edge_key = (edge["from"], edge["relation"], edge["to"])
+                if edge_key in seen_relationships:
+                    continue
+                seen_relationships.add(edge_key)
+                target_record = self._records_by_iri.get(edge["to"])
                 semantic_relationships.append(
                     {
-                        "entity": target_record.name,
+                        "entity": target_record.name if target_record else edge["to"],
                         "relation": edge["relation"],
                         "direction": edge["direction"],
                         "evidence": edge["source"],
                     }
                 )
 
-        semantic_properties.sort(
-            key=lambda item: (-item["relevance"], item["name"].casefold())
-        )
+        # Recursive hierarchies never appear in root-to-target paths, so collect them here.
+        hierarchy_relations: list[dict[str, Any]] = []
+        seen_hierarchy: set[tuple[str, str]] = set()
+        for class_record in class_records:
+            for edge in self._adjacency.get(class_record.iri, []):
+                if edge["to"] != class_record.iri or edge["direction"] != "outgoing":
+                    continue
+                hierarchy_key = (class_record.name, edge["relation"])
+                if hierarchy_key in seen_hierarchy:
+                    continue
+                seen_hierarchy.add(hierarchy_key)
+                hierarchy_relations.append(
+                    {
+                        "entity": class_record.name,
+                        "relation": edge["relation"],
+                        "recursive": True,
+                        "evidence": edge["source"],
+                    }
+                )
+
+        # Relevance only ranks; every involved class still contributes its own attributes.
+        by_entity: dict[str, list[dict[str, Any]]] = {}
+        for item in sorted(
+            semantic_properties,
+            key=lambda value: (-value["relevance"], value["name"].casefold()),
+        ):
+            by_entity.setdefault(item["entity"], []).append(item)
+        ranked_properties = [
+            item
+            for group in sorted(
+                by_entity.values(),
+                key=lambda values: -values[0]["relevance"],
+            )
+            for item in group[: self.max_results]
+        ]
 
         return self._envelope(
             "ok",
             data={
                 "root_entity": self._entity_ref(root_record.entity),
-                "semantic_properties": semantic_properties[:16],
-                "semantic_relationships": semantic_relationships[:8],
+                "semantic_properties": ranked_properties,
+                "semantic_relationships": semantic_relationships[: self.max_results],
+                "hierarchy_relations": hierarchy_relations,
+                "join_paths": join_paths,
                 "filters": [],
             },
             matches=[self._match_payload(root_record, root_score, root_strategy)],
@@ -993,14 +1039,14 @@ class OntologyService:
                 {"source": "ontology", "iri": root_record.iri},
                 *[
                     {"source": item["evidence"], "property": item["name"]}
-                    for item in semantic_properties[:8]
+                    for item in ranked_properties[:8]
                 ],
             ],
             confidence=root_score,
             strategies_tried=[
                 "root_entity_resolution",
                 "property_domain_range_analysis",
-                "semantic_neighbor_analysis",
+                "question_driven_shortest_paths",
             ],
         )
 
@@ -1010,9 +1056,13 @@ class OntologyService:
         question: str,
         *,
         root_entity: str = "",
-        max_depth: int = 3,
+        max_depth: Optional[int] = None,
     ) -> dict[str, Any]:
         """Build a composite, provenance-rich context for downstream SQL planning."""
+        depth_limit = min(
+            max(1, max_depth if max_depth is not None else self.max_depth),
+            self.max_depth,
+        )
         roots = self._candidate_root_records(question, root_entity=root_entity)
         if not roots:
             return self._envelope(
@@ -1036,13 +1086,13 @@ class OntologyService:
         semantic_result = self.get_semantic_candidates(
             question,
             root_entity=primary.iri,
-            max_depth=min(max_depth, self.max_depth),
+            max_depth=depth_limit,
         )
         schema_result = self.get_schema_mapping(primary.iri)
         if self._is_lineage_question(question):
             lineage_result = self.get_lineage(
                 primary.iri,
-                depth=min(max_depth, 2),
+                depth=min(depth_limit, 2),
             )
         else:
             lineage_result = self._envelope(
@@ -1057,30 +1107,7 @@ class OntologyService:
             )
 
         semantic_data = semantic_result.get("data") or {}
-        target_names = {
-            item.get("entity")
-            for item in semantic_data.get("semantic_properties", [])
-            if item.get("entity") and item.get("entity") != primary.name
-        }
-        target_names.update(
-            record.name
-            for record, score, _ in roots[1:5]
-            if score >= self.fuzzy_threshold and record.name != primary.name
-        )
-        join_paths = []
-        seen_semantic_paths: set[tuple[str, ...]] = set()
-        for target_name in sorted(target_names)[:6]:
-            join_result = self.get_join_paths(
-                primary.iri,
-                target_name,
-                max_depth=min(max_depth, self.max_depth),
-                max_paths=1,
-            )
-            for path in (join_result.get("data") or {}).get("join_paths", []):
-                path_key = tuple(path.get("semantic_path", []))
-                if path_key and path_key not in seen_semantic_paths:
-                    seen_semantic_paths.add(path_key)
-                    join_paths.append(path)
+        join_paths = semantic_data.get("join_paths", [])
 
         primary_description = self._describe_record(primary)
         root_entity_detail = {
@@ -1098,9 +1125,18 @@ class OntologyService:
                 "equivalent_to",
                 "disjoint_with",
                 "restrictions",
+                "properties",
             )
             if key in primary_description
         }
+        # Property IRIs are `prefix + name`, so they are emitted once here instead
+        # of being repeated on every property of every involved class.
+        iri_prefix = str(getattr(getattr(primary.entity, "namespace", None), "base_iri", ""))
+        root_entity_detail["properties"] = [
+            {key: value for key, value in prop.items() if key != "iri"}
+            for prop in (root_entity_detail.get("properties") or [])
+            if isinstance(prop, dict)
+        ]
         warnings = [
             *semantic_result.get("warnings", []),
             *schema_result.get("warnings", []),
@@ -1120,6 +1156,7 @@ class OntologyService:
             data={
                 "root_entity": primary.name,
                 "root_entity_detail": root_entity_detail,
+                "ontology_iri_prefix": iri_prefix,
                 "filters": [],
                 "semantic_properties": semantic_data.get(
                     "semantic_properties", []
@@ -1127,6 +1164,7 @@ class OntologyService:
                 "semantic_relationships": semantic_data.get(
                     "semantic_relationships", []
                 ),
+                "hierarchy_relations": semantic_data.get("hierarchy_relations", []),
                 "join_paths": join_paths,
                 "schema_mapping": schema_result.get("data"),
                 "lineage": lineage_result.get("data"),
@@ -1214,29 +1252,78 @@ class OntologyService:
                         derived[iri] = candidate
         return sorted(derived.values(), key=lambda item: -item[1])
 
-    def _related_class_records(
+    def _question_driven_subgraph(
         self,
+        question: str,
         root: _EntityRecord,
+        property_matches: list[tuple[_EntityRecord, float, str]],
         *,
-        depth: int,
-    ) -> list[_EntityRecord]:
-        records = [root]
-        queue: deque[tuple[str, int]] = deque([(root.iri, 0)])
-        visited = {root.iri}
-        while queue and len(visited) < self.max_nodes:
-            current_iri, current_depth = queue.popleft()
-            if current_depth >= depth:
+        max_depth: int,
+    ) -> tuple[list[_EntityRecord], list[dict[str, Any]]]:
+        """Select classes on shortest paths to concepts actually present in the question."""
+
+        targets: dict[str, _EntityRecord] = {root.iri: root}
+        normalized_question = self._normalize(question)
+        for record, _, _ in self._search_records(
+            question,
+            entity_types={"class"},
+            limit=10,
+        ):
+            if any(
+                normalized_name and normalized_name in normalized_question
+                for normalized_name in record.normalized_names
+            ):
+                targets[record.iri] = record
+
+        for property_record, _, _ in property_matches:
+            for value in [
+                *list(getattr(property_record.entity, "domain", []) or []),
+                *list(getattr(property_record.entity, "range", []) or []),
+            ]:
+                record = self._records_by_iri.get(self._known_iri(value))
+                if record and record.kind == "class":
+                    targets[record.iri] = record
+
+        selected: dict[str, _EntityRecord] = {root.iri: root}
+        join_paths: list[dict[str, Any]] = []
+        seen_paths: set[tuple[str, ...]] = set()
+        for target in targets.values():
+            if target.iri == root.iri:
                 continue
-            for edge in self._adjacency.get(current_iri, []):
-                target_iri = edge["to"]
-                if target_iri in visited:
+            path_result = self.find_paths(
+                root.iri,
+                target.iri,
+                max_depth=max_depth,
+                max_paths=self.max_paths,
+            )
+            paths = (path_result.get("data") or {}).get("paths", [])
+            if not paths:
+                selected[target.iri] = target
+                continue
+            shortest_depth = min(len(path.get("edges", [])) for path in paths)
+            for path in paths:
+                if len(path.get("edges", [])) != shortest_depth:
                     continue
-                visited.add(target_iri)
-                target_record = self._records_by_iri.get(target_iri)
-                if target_record and target_record.kind == "class":
-                    records.append(target_record)
-                    queue.append((target_iri, current_depth + 1))
-        return records[: self.max_results]
+                path_key = tuple(path.get("semantic_path", []))
+                if not path_key or path_key in seen_paths:
+                    continue
+                seen_paths.add(path_key)
+                semantic_edges = path.get("edges", [])
+                join_paths.append(
+                    {
+                        "semantic_path": path["semantic_path"],
+                        "semantic_edges": semantic_edges,
+                        "physical_joins": [],
+                        "requires_metadata_resolution": True,
+                    }
+                )
+                for edge in semantic_edges:
+                    for iri in (edge["from"], edge["to"]):
+                        record = self._records_by_iri.get(iri)
+                        if record and record.kind == "class":
+                            selected[iri] = record
+
+        return list(selected.values()), join_paths
 
     def _record_matches_class(self, record: _EntityRecord, target_class: Any) -> bool:
         try:
@@ -1430,14 +1517,32 @@ class OntologyService:
                 break
         return properties
 
+    @staticmethod
+    def _compact_ref(value: Any) -> Any:
+        """Collapse an entity reference or a Python type repr to its bare name.
+
+        ``domain``/``range`` are repeated on every property, so the full
+        ``{iri, name, type}`` dict and the ``<class 'str'>`` repr are pure
+        overhead: the name alone carries the same fact.
+        """
+
+        if isinstance(value, dict):
+            name = value.get("name")
+            if name:
+                return name
+            return value
+        text = str(value)
+        match = re.fullmatch(r"<class '(?:[\w.]+\.)?(\w+)'>", text)
+        return match.group(1) if match else text
+
     def _property_summary(self, prop: Any) -> dict[str, Any]:
         record = self._records_by_iri.get(str(getattr(prop, "iri", "") or ""))
         return {
             **self._entity_ref(prop),
             "labels": list(record.labels) if record else [],
             "comments": list(record.comments) if record else [],
-            "domain": [self._json_value(value) for value in list(getattr(prop, "domain", []) or [])],
-            "range": [self._json_value(value) for value in list(getattr(prop, "range", []) or [])],
+            "domain": [self._compact_ref(self._json_value(value)) for value in list(getattr(prop, "domain", []) or [])],
+            "range": [self._compact_ref(self._json_value(value)) for value in list(getattr(prop, "range", []) or [])],
             "characteristics": [
                 str(getattr(value, "name", value))
                 for value in list(getattr(prop, "is_a", []) or [])
@@ -1499,12 +1604,15 @@ class OntologyService:
                 if substring_score > best:
                     best, strategy = substring_score, "substring"
             candidate_token_set = set(candidate.split())
+            # Only treat an embedded CJK label as a mention when the query is a sentence around it.
+            # Without this, 单价 would claim 客单价, which is a different metric.
             embedded_cjk_tokens = [
                 token
                 for token in candidate_token_set
                 if len(token) >= 2
                 and re.fullmatch(r"[\u3400-\u9fff]+", token)
                 and token in normalized_query
+                and len(token) * 2 <= len(normalized_query)
             ]
             if embedded_cjk_tokens and best < 0.86:
                 best, strategy = 0.86, "label_token_in_query"

@@ -6,6 +6,7 @@ Follows MAF 1.11 best practices with OpenAIChatCompletionClient.
 from typing import List, Dict, Any, Optional, Annotated, Callable
 from pydantic import Field
 
+from ..config import AgentReasoningConfig
 from ..tools import AzureAISearchTool
 from ..prompts import SEARCH_AGENT_PROMPT
 from ..utils import get_logger
@@ -260,7 +261,7 @@ class SearchAgent:
             name="SearchAgent",
             instructions=SEARCH_AGENT_PROMPT,
             tools=tools,
-            temperature=0.6,
+            reasoning_effort=AgentReasoningConfig.SEARCH,
         )
         logger.info("SearchAgent created with MAF OpenAIChatCompletionClient")
         return agent

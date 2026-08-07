@@ -1,11 +1,11 @@
 ---
-name: ontology-sql-planning
+name: sql-planning
 description: Dynamically plans ad-hoc Databricks SQL from user intent, optional OWL business semantics, and verified Unity Catalog metadata. Load for every analysis that does not match a governed SQL template.
 metadata:
   tags: ontology, sql, databricks, dynamic-planning
 ---
 
-# Ontology SQL Planning
+# SQL Planning
 
 Use this Skill to turn semantic evidence into a query plan at runtime. It defines a planning
 process, not a metric catalog, fixed analytical formula, default comparison, or SQL template.
@@ -62,6 +62,22 @@ process, not a metric catalog, fixed analytical formula, default comparison, or 
    decomposition, or dimension list.
 6. Execute the smallest evidence set that answers the question. Distinguish measured observations
    from explanatory hypotheses, and do not claim causality without appropriate evidence.
+
+## Degenerate Result Diagnostics
+
+`execute_sql` profiles every result for empty output, all-zero comparison fields, pairwise-identical
+measures, constant measures, and unexpectedly low sample size. If its `<result_diagnostics>` block
+sets `requires_follow_up=true`:
+
+1. Do not finalize the answer from the degenerate ranking or comparison.
+2. Execute exactly one focused follow-up with `purpose="diagnostic"`.
+3. Build that query from the selected ontology entities/relations and verified physical schema; do
+   not use domain-specific column names from examples or guess unverified identifiers.
+4. Test the smallest source-level explanation that discriminates among: equal source roles/values,
+   equality introduced by aggregation or grain, missing/null mappings, low distinct cardinality,
+   and insufficient period/sample coverage.
+5. Report measured diagnostics separately from hypotheses. A tied result is not a meaningful Top-N;
+   state that the requested ranking has no discriminatory power when the diagnostic confirms it.
 
 ## SQL Engineering
 

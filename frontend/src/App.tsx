@@ -8,7 +8,7 @@ import remarkGfm from 'remark-gfm';
 import { ActivityPanel } from './components/ActivityPanel';
 import type { ActivityItem, ActivityKind, ActivityState } from './types/activity';
 
-// Example questions from the enterprise knowledge base (matching app.py EXAMPLE_QUESTIONS)
+// Example questions spanning the enterprise knowledge base and Databricks analytics
 const EXAMPLE_QUERIES = [
   "汽车用液化天然气的加液口基本构型",
   "电动汽车用动力蓄电池安全要求",
@@ -17,9 +17,11 @@ const EXAMPLE_QUERIES = [
   "哪个客户在2023年的消费是最高的",
   "按月看2023年的销售额趋势",
   "哪个地区的成交量是最高的，在这个地区那个产品销量最高，并且结合数据分析原因",
-  "按企业正式定义分析 2023 年高价值订单的月度趋势、订单占比和销售额贡献率。",
+  "按企业定义分析 2023 年高价值订单的月度趋势、订单占比和销售额贡献率。",
   "按地区同时比较订单数、销量、销售额和平均客单价，并解释最高地区领先第二名的主要结构因素。",
-  "2024年高价值在线订单主要来自哪类客户、发往哪些地区、集中在哪些顶层产品大类？并区分观察事实、解释假设和因果结论。"
+  "2023年高价值订单主要来自哪类客户、发往哪些地区、集中在哪些顶层产品大类？",
+  "比较2023与2024年的折扣明细占比、折扣销量贡献和平均单价折扣率，并沿产品类目层级汇总到顶层大类，找出折扣最集中的大类。",
+  "2023年各顶层产品大类的销量和订单明细分别是多少？沿产品类目层级将子类目汇总到顶层，并找出每个顶层大类贡献最高的子类目及其贡献率。"
 ];
 
 interface MessageWithThinking extends ChatMessage {
@@ -85,27 +87,70 @@ const referenceGroupKeys = (url: string): string[] => {
   }
 };
 
+const tableRowCells = (row: string): string[] | null => {
+  const stripped = row.trim();
+  if (stripped.length < 2 || !stripped.startsWith('|') || !stripped.endsWith('|')) {
+    return null;
+  }
+  return stripped.slice(1, -1).split('|');
+};
+
+const isTableSeparatorRow = (cells: string[]): boolean =>
+  cells.length > 0 && cells.every(cell => /^\s*:?-{3,}:?\s*$/.test(cell));
+
+const splitCollapsedTableRow = (
+  line: string,
+  expectedCells: number | null
+): string[] | null => {
+  const candidates = line.replace(/\|\s*\|/g, '|\n|').split('\n');
+  if (candidates.length < 2) return null;
+
+  const parsed = candidates.map(tableRowCells);
+  if (parsed.some(cells => cells === null)) return null;
+
+  const widths = new Set(parsed.map(cells => (cells as string[]).length));
+  if (widths.size !== 1) return null;
+
+  const width = widths.values().next().value as number;
+  if (expectedCells !== null) {
+    // A row with genuinely empty cells splits into the wrong width, so it stays intact.
+    return width === expectedCells ? candidates : null;
+  }
+  return parsed.some(cells => isTableSeparatorRow(cells as string[])) ? candidates : null;
+};
+
 export const repairCollapsedMarkdownTables = (content: string): string => {
   if (!content || !content.includes('|')) return content;
 
   const repairedLines: string[] = [];
   let inCodeFence = false;
-  const separatorCellPattern = /\|\s*:?-{3,}:?\s*\|/;
-  const rowBoundaryPattern = /\|\s*\|/g;
+  let expectedCells: number | null = null;
 
   for (const line of content.split('\n')) {
     if (line.trimStart().startsWith('```')) {
       inCodeFence = !inCodeFence;
+      expectedCells = null;
       repairedLines.push(line);
       continue;
     }
 
-    const pipeCount = (line.match(/\|/g) || []).length;
-    if (!inCodeFence && pipeCount >= 6 && separatorCellPattern.test(line)) {
-      repairedLines.push(...line.replace(rowBoundaryPattern, '|\n|').split('\n'));
-    } else {
+    const cells = inCodeFence ? null : tableRowCells(line);
+    if (cells === null) {
+      expectedCells = null;
       repairedLines.push(line);
+      continue;
     }
+
+    const rows = splitCollapsedTableRow(line, expectedCells);
+    if (rows === null) {
+      repairedLines.push(line);
+      if (isTableSeparatorRow(cells)) expectedCells = cells.length;
+      continue;
+    }
+
+    repairedLines.push(...rows);
+    const firstRow = tableRowCells(rows[0]);
+    expectedCells = firstRow ? firstRow.length : null;
   }
 
   return repairedLines.join('\n');
@@ -278,6 +323,8 @@ function App() {
   const [businessLayerStatus, setBusinessLayerStatus] = useState('');
   const [businessLayerBusy, setBusinessLayerBusy] = useState(false);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+  const programmaticScrollRef = useRef(false);
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const initialSessionRequestedRef = useRef(false);
 
@@ -333,10 +380,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (chatContainerRef.current && autoScroll) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-    }
-  }, [messages, autoScroll]);
+    autoScrollRef.current = autoScroll;
+  }, [autoScroll]);
+
+  // Reads the ref, not the state, so a streaming update never re-applies a stale intent.
+  useEffect(() => {
+    const container = chatContainerRef.current;
+    if (!container || !autoScrollRef.current) return;
+    programmaticScrollRef.current = true;
+    container.scrollTop = container.scrollHeight;
+  }, [messages]);
 
   // 监听用户滚动
   useEffect(() => {
@@ -344,13 +397,30 @@ function App() {
     if (!container) return;
 
     const handleScroll = () => {
+      if (programmaticScrollRef.current) {
+        programmaticScrollRef.current = false;
+        return;
+      }
       const { scrollTop, scrollHeight, clientHeight } = container;
       const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
+      autoScrollRef.current = isNearBottom;
       setAutoScroll(isNearBottom);
     };
 
+    // Scrolling up is unambiguous intent to read, so release the stream immediately.
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0 && autoScrollRef.current) {
+        autoScrollRef.current = false;
+        setAutoScroll(false);
+      }
+    };
+
     container.addEventListener('scroll', handleScroll);
-    return () => container.removeEventListener('scroll', handleScroll);
+    container.addEventListener('wheel', handleWheel, { passive: true });
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleWheel);
+    };
   }, []);
 
   const initializeApplication = async () => {
