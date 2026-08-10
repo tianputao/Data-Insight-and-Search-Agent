@@ -7,7 +7,6 @@ from contextvars import ContextVar, copy_context
 from threading import Event
 from typing import List, Dict, Any, Optional, Annotated
 import json
-import re
 import time
 from pydantic import Field
 
@@ -203,6 +202,35 @@ class MasterAgent:
                     return False
                 thread.join(timeout=min(0.1, remaining))
             return True
+
+        def stop_context_thread(
+            thread,
+            label: str,
+            result_container: Optional[Dict[str, Any]] = None,
+            *,
+            grace: float = 5.0,
+        ) -> None:
+            """Cancel a timed-out worker's task and give its loop a bounded chance to unwind.
+
+            Without this the daemon thread keeps its event loop, SQL query and connection alive
+            long after the caller has already returned a timeout to the user.
+            """
+            if result_container is not None:
+                loop = result_container.get("loop")
+                task = result_container.get("task")
+                if loop is not None and task is not None:
+                    try:
+                        loop.call_soon_threadsafe(task.cancel)
+                    except RuntimeError:
+                        pass
+            thread.join(timeout=grace)
+            if thread.is_alive():
+                logger.warning(
+                    "[%s] worker thread still running %.0fs after cancellation was requested; "
+                    "its event loop and any in-flight query remain active",
+                    label,
+                    grace,
+                )
 
         def start_agent_activity(
             agent: str,
@@ -635,6 +663,7 @@ Sub-questions:"""
             thread_finished = wait_for_context_thread(thread, 60)
             
             if not thread_finished:
+                stop_context_thread(thread, "search_multiple_queries")
                 turn = self._current_turn()
                 if turn is not None and turn.cancelled:
                     return "Search cancelled by user."
@@ -678,7 +707,7 @@ Sub-questions:"""
             results_list = all_results["results"]
             
             if not results_list or all(len(r) == 0 for r in results_list):
-                logger.warning(f"[Tool] No results found for any query")
+                logger.warning("[Tool] No results found for any query")
                 finish_agent_activity(
                     agent_activity_id,
                     "SearchAgent",
@@ -831,7 +860,6 @@ Sub-questions:"""
             agent_activity_id, agent_started_at, search_attempt = start_search_activity(query)
 
             import asyncio
-            import threading
 
             streaming_ctx = turn.stream_context if turn is not None else None
 
@@ -882,6 +910,7 @@ Sub-questions:"""
             thread_finished = wait_for_context_thread(thread, 30)
 
             if not thread_finished:
+                stop_context_thread(thread, "search_knowledge")
                 turn = self._current_turn()
                 if turn is not None and turn.cancelled:
                     return "Search cancelled by user."
@@ -903,7 +932,7 @@ Sub-questions:"""
                 return "Search timeout: The search operation took too long to complete."
 
             if result_container["error"]:
-                logger.error(f"[Tool] search_knowledge failed", exc_info=result_container["error"])
+                logger.error("[Tool] search_knowledge failed", exc_info=result_container["error"])
                 finish_agent_activity(
                     agent_activity_id,
                     "SearchAgent",
@@ -924,7 +953,7 @@ Sub-questions:"""
             results_dict = result_container["result"]
 
             if not results_dict or not results_dict.get("results"):
-                logger.warning(f"[Tool] search_knowledge: No results found")
+                logger.warning("[Tool] search_knowledge: No results found")
                 finish_agent_activity(
                     agent_activity_id,
                     "SearchAgent",
@@ -1095,13 +1124,7 @@ Sub-questions:"""
                 DatabricksConfig.METADATA_AGENT_TIMEOUT_SECONDS,
             )
             if not thread_finished:
-                loop = result_container.get("loop")
-                task = result_container.get("task")
-                if loop is not None and task is not None:
-                    try:
-                        loop.call_soon_threadsafe(task.cancel)
-                    except RuntimeError:
-                        pass
+                stop_context_thread(thread, "MetadataAgent", result_container)
                 turn = self._current_turn()
                 if turn is not None and turn.cancelled:
                     reason = "Metadata lookup cancelled by user"
@@ -1157,6 +1180,14 @@ Sub-questions:"""
                     "MetadataAgent error: no grounded Unity Catalog tool results "
                     "were produced."
                 )
+            supplemented_count = 0
+            if ontology_context and hasattr(
+                self.metadata_agent,
+                "supplement_schema_snapshot",
+            ):
+                supplemented_count = self.metadata_agent.supplement_schema_snapshot(
+                    tool_results
+                )
             metadata_result = self.metadata_agent.build_collected_context(
                 agent_summary,
                 tool_results,
@@ -1188,6 +1219,7 @@ Sub-questions:"""
                     "tool_result_count": len(tool_results),
                     "table_detail_count": detail_count,
                     "cache_hit_count": cache_hit_count,
+                    "supplemented_table_count": supplemented_count,
                     "model_summary_chars": len(agent_summary),
                 },
             )
@@ -1298,13 +1330,7 @@ Sub-questions:"""
                 OntologyConfig.AGENT_TIMEOUT_SECONDS,
             )
             if not thread_finished:
-                loop = result_container.get("loop")
-                task = result_container.get("task")
-                if loop is not None and task is not None:
-                    try:
-                        loop.call_soon_threadsafe(task.cancel)
-                    except RuntimeError:
-                        pass
+                stop_context_thread(thread, "OntologyAgent", result_container)
                 reason = (
                     "OntologyAgent timed out after "
                     f"{OntologyConfig.AGENT_TIMEOUT_SECONDS} seconds"
@@ -1547,7 +1573,7 @@ Sub-questions:"""
                 ),
             )
             error_container: Dict[str, Any] = {"error": None}
-            result_container: Dict[str, str] = {"result": ""}
+            result_container: Dict[str, Any] = {"result": "", "loop": None, "task": None}
             turn = self._current_turn()
             original_user_question = (
                 turn.original_question.strip()
@@ -1560,6 +1586,7 @@ Sub-questions:"""
                 import asyncio as _asyncio
                 loop = _asyncio.new_event_loop()
                 _asyncio.set_event_loop(loop)
+                result_container["loop"] = loop
                 try:
                     downstream_question = question
                     if original_user_question:
@@ -1567,7 +1594,7 @@ Sub-questions:"""
                             f"<original_user_question>\n{original_user_question}\n</original_user_question>\n\n"
                             f"<delegated_question>\n{question}\n</delegated_question>"
                         )
-                    result_container["result"] = loop.run_until_complete(
+                    task = loop.create_task(
                         collect_nested_agent_stream(
                             self.data_insight_agent.query_stream(
                                 downstream_question,
@@ -1583,6 +1610,8 @@ Sub-questions:"""
                             stream_final_text=True,
                         )
                     )
+                    result_container["task"] = task
+                    result_container["result"] = loop.run_until_complete(task)
                 except Exception as exc:
                     error_container["error"] = exc
                     logger.error(f"[data_analysis_pipeline] streaming error: {exc}", exc_info=True)
@@ -1600,6 +1629,7 @@ Sub-questions:"""
             thread_finished = wait_for_context_thread(t, 180)
 
             if not thread_finished:
+                stop_context_thread(t, "DataInsightAgent", result_container)
                 turn = self._current_turn()
                 if turn is not None and turn.cancelled:
                     return "DataInsight query cancelled by user."
@@ -1711,7 +1741,14 @@ Sub-questions:"""
                 governed_skill_context = ""
 
                 if ontology_requested:
-                    ontology_result = _run_ontology(question)
+                    # Ontology lookup is literal label matching, so a rewritten question can
+                    # shift the resolved root entity. Downstream agents still get the rewrite.
+                    ontology_question = (
+                        turn.original_question.strip()
+                        if turn is not None and turn.original_question
+                        else question
+                    ) or question
+                    ontology_result = _run_ontology(ontology_question)
                     if turn is not None and turn.cancelled:
                         push_stream_event(
                             "activity",
@@ -1902,50 +1939,8 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             New AgentThread instance
         """
         thread = create_session(self.agent)
-        logger.info(f"Created new conversation thread")
+        logger.info("Created new conversation thread")
         return thread
-    
-    async def chat(
-        self,
-        message: str,
-        thread=None,
-        enable_ontology: Optional[bool] = None,
-        business_layer: str = "",
-    ) -> Dict[str, Any]:
-        """
-        Process a user message and generate a response.
-        
-        Args:
-            message: User message
-            thread: Optional conversation thread for multi-turn context
-            
-        Returns:
-            Agent response with text and metadata
-        """
-        logger.info(f"MasterAgent.chat called with message: '{message}'")
-        turn = self._new_turn(
-            message,
-            enable_ontology=enable_ontology,
-            business_layer=business_layer,
-        )
-        context_var = self._turn_context_var()
-        token = context_var.set(turn)
-
-        try:
-            contextual_message = self._with_runtime_context(
-                message,
-                enable_ontology=turn.enable_ontology,
-            )
-            result = await run_agent(self.agent, contextual_message, session=thread)
-        finally:
-            context_var.reset(token)
-
-        logger.info(f"MasterAgent.chat completed, response length: {len(result.text)}")
-
-        return {
-            "text": result.text,
-            "messages": [{"role": msg.role, "content": msg.text} for msg in result.messages],
-        }
     
     async def chat_stream(
         self,

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from threading import Event
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
+from urllib.parse import parse_qsl, urlsplit, urlunsplit, unquote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +56,7 @@ from src.agents import (
 )
 from src.ontology import OntologyService
 from src.tools import AzureAISearchTool
-from src.config import AppConfig, AzureSearchConfig, DatabricksConfig
+from src.config import AppConfig, AzureSearchConfig
 from src.business_layer import load_business_layer, save_business_layer
 from src.utils import get_logger
 from src.utils.activity import (

@@ -209,14 +209,26 @@ two spaces, and do not nest deeper than two levels.
 5. **计算口径 / Definitions Used** — a compact table with one row for every business term, filter, and
    time window this answer relied on. Use the columns 业务词 / 采用字段 / 粒度 / 来源, or the English
    equivalents Term / Column / Grain / Source. Build 采用字段 from `<measures_used>`, never from memory.
-   来源 must be exactly one label from `allowed_source_labels` in `<definition_provenance>`: never
-   invent, merge, reword, or combine labels, and never use a label the list omits. Claim a specific
-   source only when you can point to the artefact that supplied that mapping, and downgrade to
-   推断 / Inferred whenever you are unsure, because an over-claimed source is worse than an honest
-   推断. A source counts only when it names the choice itself. Claim a Skill or a system default only
-   where that artefact states a concrete default for the term in that row; a ranking procedure,
-   authority ordering, grain discipline, or SQL-engineering rule tells you how to decide, not what to
-   decide, so a choice you reached by applying one is 推断 / Inferred. For every 推断 row, name the
+
+   Give each business term exactly one row, and keep a term's field separate from any role or level
+   choice made about it: when you had to pick between candidate roles, levels, or date columns, that
+   choice gets its own row rather than being folded into the term's row. Keep the row set stable for
+   a given question: list the terms the question asked for first, in the order the question names
+   them, then any derived measure you added.
+
+   来源 must be copied verbatim from `allowed_source_labels` in `<definition_provenance>`, including
+   both sides of a paired label such as `推断 / Inferred`. Never invent, merge, reword, translate,
+   shorten, or localise a label, and never use a label the list omits — the answer language governs
+   the prose, never these labels. Claim a specific source only when you can point to the artefact
+   that supplied that mapping, and downgrade to 推断 / Inferred whenever you are unsure, because an
+   over-claimed source is worse than an honest 推断. A source counts only when it names the choice
+   itself. Claim a Skill or the ontology only where that artefact states a concrete default for the
+   term in that row; a ranking procedure, authority ordering, grain discipline, or SQL-engineering
+   rule tells you how to decide, not what to decide, so a choice you reached by applying one is
+   推断 / Inferred. Any choice made by a rule in these instructions rather than by an artefact — the
+   full-range analysis window when the question names no period, the finer level when a broader one
+   is constant, the ranking measure when the question does not name one — is 系统默认 / System
+   default and must never be attributed to the ontology or to a Skill. For every 推断 row, name the
    defensible alternative you did not use. Close the section with
    one line stating that MetadataAgent verified every physical column name in Unity Catalog, that a
    derived name is computed in SQL rather than stored, and that 来源 describes only the business-term

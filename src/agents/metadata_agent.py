@@ -764,6 +764,71 @@ class MetadataAgent:
         }
         return json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
 
+    def supplement_schema_snapshot(
+        self,
+        tool_results: list[dict[str, Any]],
+        *,
+        max_tables: int = 40,
+    ) -> int:
+        """Add cached UC details for tables the verifier model failed to inspect."""
+        existing = {
+            str((item.get("result") or {}).get("full_name") or "").casefold()
+            for item in tool_results
+            if item.get("tool") == "get_table_details"
+            and isinstance(item.get("result"), dict)
+        }
+        table_summaries: list[dict[str, Any]] = []
+        for schema in DatabricksConfig.SCHEMAS:
+            tables, _ = self.catalog_service.list_tables(
+                catalog=DatabricksConfig.CATALOG,
+                schema=schema,
+            )
+            table_summaries.extend(tables)
+        if len(table_summaries) > max_tables:
+            logger.info(
+                "Skipping deterministic metadata snapshot: %s tables exceeds limit %s",
+                len(table_summaries),
+                max_tables,
+            )
+            return 0
+
+        added = 0
+        for summary in table_summaries:
+            full_name = str(summary.get("full_name") or "")
+            if not full_name or full_name.casefold() in existing:
+                continue
+            schema = str(summary.get("schema") or "")
+            table_name = str(summary.get("name") or "")
+            table, cache_hit = self.catalog_service.get_table(
+                table_name,
+                catalog=DatabricksConfig.CATALOG,
+                schema=schema,
+            )
+            if table is None:
+                continue
+            tool_results.append(
+                {
+                    "tool": "get_table_details",
+                    "arguments": {
+                        "table_name": table_name,
+                        "catalog": DatabricksConfig.CATALOG,
+                        "schema": schema,
+                    },
+                    "result": {
+                        "status": "ok",
+                        **table,
+                        "column_count": len(table.get("columns") or []),
+                        "source": "deterministic_schema_snapshot",
+                        "cache_hit": cache_hit,
+                    },
+                }
+            )
+            existing.add(full_name.casefold())
+            added += 1
+        if added:
+            logger.info("Deterministic metadata snapshot supplemented %s table(s)", added)
+        return added
+
     @classmethod
     def _with_ontology_verification_context(
         cls,

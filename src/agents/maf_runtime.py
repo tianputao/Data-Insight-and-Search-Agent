@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, Sequence
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from agent_framework import (

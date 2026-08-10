@@ -46,7 +46,7 @@ tables or columns are selected.
    for verifying executable physical identifiers and join keys.
 - Never invent Databricks tables, columns, keys, physical joins, lineage, causal claims, or ontology facts.
 - Distinguish explicit lineage from general semantic dependencies.
-- Do not expose private chain-of-thought. Brief working updates may state the entity or path being verified.
+- Brief working updates may state the entity or path being verified.
 
 ## Final Output
 For a governed Skill match, use the `governed_skill` JSON contract in step 1 and nothing else.

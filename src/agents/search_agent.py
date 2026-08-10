@@ -78,7 +78,7 @@ class SearchAgent:
             """
             logger.info(f"[Tool] parallel_search called with {len(queries)} queries")
             results = self.search_tool.parallel_search(queries)
-            logger.info(f"[Tool] parallel_search completed")
+            logger.info("[Tool] parallel_search completed")
             return results
         
         return [search_knowledge_base, parallel_search]

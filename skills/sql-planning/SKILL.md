@@ -23,17 +23,12 @@ process, not a metric catalog, fixed analytical formula, default comparison, or 
 
 ## Ambiguity Resolution
 
+Your instructions already define how to separate a formal-definition gap from an operational choice,
+how to rank candidates, and when asking the user is warranted. Apply that policy; this Skill adds
+only the parts it does not cover.
+
 - Inspect the complete verified metadata evidence, including raw `get_table_details` results. A
    column present there is available even if the MetadataAgent prose summary omits it.
-- A **formal-definition gap** means the request requires an official threshold, derived class,
-   hierarchy, formula, inclusion rule, or semantic relationship that neither the question nor the
-   ontology defines. Do not invent it; ask for that precise definition when it is necessary.
-- An **operational-choice ambiguity** means multiple verified columns, roles, time fields, or
-   granularities can implement an otherwise clear request. This is not a missing-metadata error.
-   Rank the candidates by explicit user wording, ontology role/path evidence, grain compatibility,
-   and analytical usefulness. Choose the best-supported candidate, state the assumption, and execute.
-- Ask the user to choose only when the alternatives imply materially different business intent and
-   neither the question, ontology, metadata, nor observed data supports a reasonable default.
 - For a generic geography request, follow an explicitly named ontology address role. If no role is
    named, use the verified transaction-linked address role most aligned with the event being analyzed
    (for example, ship-to for delivered-sales geography) and disclose it. Use a verified geographic

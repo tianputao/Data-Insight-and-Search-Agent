@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import date, datetime, time as _time
 from decimal import Decimal
 import json
 import re
@@ -58,7 +59,8 @@ logger = get_logger(__name__)
 #   3. DataInsightAgent SQL generation and result interpretation
 # Reusing the JDBC connection eliminates the cold-start penalty for subsequent queries.
 _db_connection: Optional[Any] = None
-_db_lock = threading.Lock()
+# Re-entrant so a query can hold it across acquisition and execution.
+_db_lock = threading.RLock()
 
 
 def _validate_sql_scope(sql: str) -> Optional[str]:
@@ -401,25 +403,55 @@ def _get_db_connection():
         return _db_connection
 
 
+def _json_default(value: Any) -> str:
+    """Databricks returns date, datetime and Decimal objects that `json` cannot encode."""
+    if isinstance(value, (date, datetime, _time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _is_connection_level_error(exc: BaseException) -> bool:
+    """A server-side SQL error leaves the connection usable; anything else may not."""
+    try:
+        from databricks.sql import exc as dbsql_exc
+    except ImportError:
+        return True
+    return not isinstance(exc, dbsql_exc.ServerOperationError)
+
+
 def _run_databricks_query(sql: str, max_rows: int = 500) -> Dict[str, Any]:
     """
     Execute *sql* against the configured Databricks SQL warehouse.
     Reuses a persistent connection to avoid per-call cold-start latency.
     """
-    connection = _get_db_connection()
-    try:
-        cursor = connection.cursor()
-        cursor.execute(sql)
-        raw_rows = cursor.fetchmany(max_rows)
-        columns = [desc[0] for desc in (cursor.description or [])]
-        rows = [list(row) for row in raw_rows]
-        return {"columns": columns, "rows": rows, "row_count": len(rows), "sql": sql}
-    except Exception:
-        # Connection may have gone bad — force reconnect next call
-        global _db_connection
-        with _db_lock:
-            _db_connection = None
-        raise
+    global _db_connection
+
+    # One process-wide connection is shared by every session thread, and a DB-API
+    # connection is not safe for concurrent cursors, so queries run one at a time.
+    with _db_lock:
+        connection = _get_db_connection()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(sql)
+            raw_rows = cursor.fetchmany(max_rows)
+            columns = [desc[0] for desc in (cursor.description or [])]
+            rows = [list(row) for row in raw_rows]
+            return {"columns": columns, "rows": rows, "row_count": len(rows), "sql": sql}
+        except Exception as exc:
+            if _is_connection_level_error(exc):
+                _db_connection = None
+            raise
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
 
 class DataInsightAgent:
@@ -495,7 +527,7 @@ class DataInsightAgent:
             "purpose=\"diagnostic\". Distinguish source equality, aggregation/grain "
             "collapse, null or mapping gaps, low cardinality, and period/sample coverage. "
             "Then provide one revised final answer grounded in both query results.\n"
-            f"signals={json.dumps(state.pending_diagnostic or {}, ensure_ascii=False)}\n"
+            f"signals={json.dumps(state.pending_diagnostic or {}, ensure_ascii=False, default=_json_default)}\n"
             "</mandatory_result_diagnostic>"
         )
 
@@ -1028,7 +1060,12 @@ class DataInsightAgent:
                 )
                 diagnostic_block = (
                     "\n\n<result_diagnostics>\n"
-                    + json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":"))
+                    + json.dumps(
+                        diagnostics,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=_json_default,
+                    )
                     + "\n</result_diagnostics>"
                 )
                 measures = _extract_sql_measures(executed_sql)
@@ -1063,6 +1100,7 @@ class DataInsightAgent:
                         {"columns": columns, "rows": rows[:5], "total_rows": row_count},
                         ensure_ascii=False,
                         indent=2,
+                        default=_json_default,
                     )
                     return (
                         f"Query returned {row_count} row(s) (showing first 5 of {row_count}).\n\n"
