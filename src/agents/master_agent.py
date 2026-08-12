@@ -350,6 +350,52 @@ class MasterAgent:
                     activity,
                 )
 
+        def push_deterministic_tool_activities(
+            tool_results: List[Dict[str, Any]],
+            agent: str,
+            parent_id: str,
+        ) -> int:
+            """Summarise code-executed lookups, which never reach the model's tool channel."""
+            emitted = 0
+            for item in tool_results:
+                if item.get("origin") != "deterministic" or item.get("activity_emitted"):
+                    continue
+                name = str(item.get("tool") or "")
+                if not name:
+                    continue
+                item["activity_emitted"] = True
+                # Per-table rows would imply the answer needs every prefetched table, so the
+                # batch is reported once through the listing that selected it.
+                if name != "list_tables":
+                    continue
+                result = item.get("result") or {}
+                selected = [
+                    str(value).rsplit(".", 1)[-1]
+                    for value in (result.get("selected_tables") or [])
+                ]
+                arguments = json.dumps(item.get("arguments") or {}, ensure_ascii=False)
+                call_id = push_tool_start(name, arguments, "", agent, parent_id)
+                activity = tool_activity(
+                    name,
+                    item.get("arguments") or {},
+                    call_id,
+                    agent=agent,
+                    parent_id=parent_id,
+                )
+                activity["state"] = "completed"
+                activity["detail"] = (
+                    f"recalled {len(selected)} of {result.get('table_count', len(selected))}: "
+                    + ", ".join(selected)
+                )
+                activity["metadata"] = {
+                    "tool_name": name,
+                    "selection_basis": result.get("selection_basis"),
+                    "join_closure_tables": result.get("join_closure_tables") or [],
+                }
+                push_stream_event("activity", activity)
+                emitted += 1
+            return emitted
+
         async def collect_nested_agent_stream(
             stream,
             *,
@@ -1188,6 +1234,21 @@ Sub-questions:"""
                 supplemented_count = self.metadata_agent.supplement_schema_snapshot(
                     tool_results
                 )
+            push_deterministic_tool_activities(
+                tool_results,
+                "MetadataAgent",
+                agent_activity_id,
+            )
+            deterministic_count = sum(
+                item.get("origin") == "deterministic"
+                and item.get("tool") == "get_table_details"
+                for item in tool_results
+            )
+            selected_tables = (
+                self.metadata_agent.selected_table_names(agent_summary)
+                if hasattr(self.metadata_agent, "selected_table_names")
+                else []
+            )
             metadata_result = self.metadata_agent.build_collected_context(
                 agent_summary,
                 tool_results,
@@ -1209,17 +1270,27 @@ Sub-questions:"""
                 agent_started_at,
                 summary=(
                     (
-                        "Step 2 completed: MetadataAgent verified ontology hints "
-                        "against Unity Catalog"
+                        (
+                            "Step 2 completed: MetadataAgent verified ontology hints "
+                            "against Unity Catalog"
+                        )
+                        if ontology_context
+                        else "Step 1 completed: MetadataAgent resolved UC schema context"
                     )
-                    if ontology_context
-                    else "Step 1 completed: MetadataAgent resolved UC schema context"
+                    + (
+                        "; selected "
+                        + ", ".join(name.rsplit(".", 1)[-1] for name in selected_tables)
+                        if selected_tables
+                        else ""
+                    )
                 ),
                 metrics={
                     "tool_result_count": len(tool_results),
                     "table_detail_count": detail_count,
                     "cache_hit_count": cache_hit_count,
-                    "supplemented_table_count": supplemented_count,
+                    "prefetched_table_count": deterministic_count,
+                    "selected_table_count": len(selected_tables),
+                    "post_hoc_supplemented_count": supplemented_count,
                     "model_summary_chars": len(agent_summary),
                 },
             )
@@ -1373,6 +1444,11 @@ Sub-questions:"""
             raw_result = ontology_agent.build_collected_context(
                 str(result_container["result"] or "").strip(),
                 result_container["tool_results"],
+            )
+            push_deterministic_tool_activities(
+                result_container["tool_results"],
+                "OntologyAgent",
+                agent_activity_id,
             )
 
             try:

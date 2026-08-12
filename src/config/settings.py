@@ -181,6 +181,21 @@ class DatabricksConfig:
         1,
         int(os.getenv('METADATA_AGENT_MAX_FUNCTION_CALLS', '8')),
     )
+
+    # Candidate recall bounds. The index scan stays server-side; only candidates reach the prompt.
+    METADATA_INDEX_MAX_TABLES = max(
+        1,
+        int(os.getenv('METADATA_INDEX_MAX_TABLES', '500')),
+    )
+    METADATA_CANDIDATE_MAX_TABLES = max(
+        1,
+        int(os.getenv('METADATA_CANDIDATE_MAX_TABLES', '12')),
+    )
+    # Used only when recall finds no candidate at all, so a small schema still resolves.
+    METADATA_SNAPSHOT_MAX_TABLES = max(
+        1,
+        int(os.getenv('METADATA_SNAPSHOT_MAX_TABLES', '40')),
+    )
     
     @classmethod
     def is_configured(cls) -> bool:
@@ -228,6 +243,11 @@ class OntologyConfig:
     )
     # Optional safety net for handed-off evidence size. 0 disables any size-based dropping.
     CONTEXT_MAX_CHARS = max(0, int(os.getenv('ONTOLOGY_CONTEXT_MAX_CHARS', '0')))
+    # Below this composite confidence the deterministic lookup hands off to the tool-using agent.
+    ESCALATION_MIN_CONFIDENCE = min(
+        1.0,
+        max(0.0, float(os.getenv('ONTOLOGY_ESCALATION_MIN_CONFIDENCE', '0.5'))),
+    )
 
 
 class AppConfig:

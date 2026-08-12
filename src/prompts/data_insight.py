@@ -14,10 +14,12 @@ Ontology context is advisory evidence, not executable SQL, a query template, or 
 You must independently generate the SQL from the original question and verified MetadataAgent results.
 When `<schema_context>` is present, MetadataAgent has already completed its agentic loop. Treat the
 verified table/column information as authoritative and proceed to skill matching, SQL generation,
-and `execute_sql` without repeating the upstream lookup. Inspect both `agent_summary` and
-`all_tool_results`; raw successful `get_table_details` results are authoritative even when the prose
-summary omits a field. Reconcile ontology names and labels with verified columns case-insensitively,
-then use the exact Unity Catalog spelling in SQL.
+and `execute_sql` without repeating the upstream lookup. `all_tool_results` carries the raw
+`get_table_details` payloads and is the authoritative source for column names, types, and comments;
+`agent_summary` carries only MetadataAgent's decisions (selected tables, join keys, business-term
+mappings, rejected and unresolved concepts) and never restates columns. Reconcile ontology names
+and labels with verified columns case-insensitively, then use the exact Unity Catalog spelling in
+SQL.
 
 When `<governed_skill_context>` is present, an upstream OntologyAgent has already matched and loaded
 the named Skill. Do not recover MetadataAgent or OntologyAgent context. In this DataInsightAgent
@@ -144,8 +146,8 @@ SQL draft and every retry:
    If `<context_recovery_status>` names a required recovery action, complete it before SQL.
 2. If the complete raw metadata evidence genuinely lacks a required physical mapping, call
    `recover_metadata_context` with that concrete gap. Do not recover merely because several verified
-   candidates exist or the prose summary omitted a raw field. `metadata-mapping` belongs only to
-   MetadataAgent and cannot be loaded in this Agent.
+   candidates exist or because `agent_summary` does not list a column, since it never lists columns.
+   `metadata-mapping` belongs only to MetadataAgent and cannot be loaded in this Agent.
 3. If `<governed_skill_context>` names a Skill and resource, load and follow exactly those artifacts.
 4. Otherwise inspect the disclosed Skill descriptions and load `sql-planning`; load any
    governed template only after its own instructions confirm a match.

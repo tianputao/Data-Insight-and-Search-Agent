@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 import json
+import re
+import unicodedata
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import Field
@@ -38,6 +40,37 @@ from .maf_runtime import (
 )
 
 logger = get_logger(__name__)
+
+_ID_SUFFIX_MIN = 5
+# Shortest entity noun that may link a role-prefixed key to a domain-prefixed table.
+_ENTITY_NOUN_MIN = 6
+# Shortest term allowed to match inside a run-together identifier.
+_COMPACT_TERM_MIN = 5
+_RECALL_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "this", "that", "has", "have",
+        "sales", "data", "table", "column", "value", "name", "id",
+    }
+)
+
+
+def _recall_tokens(value: Any) -> set[str]:
+    """Split identifiers, labels and comments into comparable lowercase tokens."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = text.casefold()
+    text = re.sub(r"[_\-/.]+", " ", text)
+    text = re.sub(r"[^\w\u3400-\u9fff]+", " ", text, flags=re.UNICODE)
+    return {token for token in text.split() if token}
+
+
+def _compact_hits(terms: set[str], compact: str) -> int:
+    """Count terms embedded in a run-together identifier, ignoring short noise."""
+    if not compact:
+        return 0
+    return sum(
+        1 for term in terms if len(term) >= _COMPACT_TERM_MIN and term in compact
+    )
 
 
 def _jdbc_query_metadata(sql: str) -> List[Dict[str, Any]]:
@@ -573,6 +606,28 @@ class MetadataAgent:
         return self.catalog_service.rewrite_sql_identifiers(sql)
 
     @staticmethod
+    def selected_table_names(agent_summary: str) -> list[str]:
+        """Read the tables the verifier actually selected out of the recalled candidates."""
+        text = (agent_summary or "").strip()
+        if not text:
+            return []
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return []
+        try:
+            payload = json.loads(text[start : end + 1])
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        return [
+            str(value)
+            for value in payload.get("selected_tables", []) or []
+            if str(value or "").strip()
+        ]
+
+    @staticmethod
     def build_collected_context(
         agent_summary: str,
         tool_results: list[dict[str, Any]],
@@ -764,70 +819,328 @@ class MetadataAgent:
         }
         return json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
 
+    @staticmethod
+    def _table_detail_record(
+        table: dict[str, Any],
+        *,
+        cache_hit: bool,
+    ) -> dict[str, Any]:
+        return {
+            "tool": "get_table_details",
+            "origin": "deterministic",
+            "arguments": {
+                "table_name": table.get("name"),
+                "catalog": DatabricksConfig.CATALOG,
+                "schema": table.get("schema"),
+            },
+            "result": {
+                "status": "ok",
+                **table,
+                "column_count": len(table.get("columns") or []),
+                "source": "deterministic_schema_snapshot",
+                "cache_hit": cache_hit,
+            },
+        }
+
+    @staticmethod
+    def _recalled_table_names(tool_results: list[dict[str, Any]]) -> list[str]:
+        """Return the candidate set an earlier recall pass committed to, if any."""
+        for item in tool_results:
+            if item.get("tool") != "list_tables" or item.get("origin") != "deterministic":
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict):
+                continue
+            selected = result.get("selected_tables")
+            if isinstance(selected, list) and selected:
+                return [str(name) for name in selected if name]
+        return []
+
+    def _index_summaries(self) -> list[dict[str, Any]]:
+        """List every allowlisted table once; no column is fetched here."""
+        summaries: list[dict[str, Any]] = []
+        for schema in DatabricksConfig.SCHEMAS:
+            tables, _ = self.catalog_service.list_tables(
+                catalog=DatabricksConfig.CATALOG,
+                schema=schema,
+            )
+            summaries.extend(tables)
+            if len(summaries) >= DatabricksConfig.METADATA_INDEX_MAX_TABLES:
+                break
+        return summaries[: DatabricksConfig.METADATA_INDEX_MAX_TABLES]
+
+    def _recall_terms(self, question: str, ontology_context: str) -> tuple[set[str], set[str]]:
+        """Split retrieval terms into ontology-backed terms and plain question terms."""
+        ontology_terms: set[str] = set()
+        if ontology_context:
+            try:
+                projection = json.loads(
+                    self.build_ontology_verification_context(ontology_context) or "{}"
+                )
+            except (TypeError, json.JSONDecodeError):
+                projection = {}
+            # A single-entity question carries its whole meaning on the root, so the
+            # root name has to seed recall even when no join path was resolved.
+            ontology_terms |= _recall_tokens(projection.get("root_entity"))
+            root_detail = projection.get("root_entity_detail")
+            if isinstance(root_detail, dict):
+                ontology_terms |= _recall_tokens(root_detail.get("name"))
+                for prop in root_detail.get("properties", []) or []:
+                    if isinstance(prop, dict):
+                        ontology_terms |= _recall_tokens(prop.get("name"))
+            for group in projection.get("semantic_property_groups", []) or []:
+                if not isinstance(group, dict):
+                    continue
+                ontology_terms |= _recall_tokens(group.get("entity"))
+                for prop in group.get("properties", []) or []:
+                    if isinstance(prop, dict):
+                        ontology_terms |= _recall_tokens(prop.get("name"))
+            for relation in projection.get("required_relations", []) or []:
+                if isinstance(relation, dict):
+                    ontology_terms |= _recall_tokens(relation.get("source"))
+                    ontology_terms |= _recall_tokens(relation.get("target"))
+            for candidate in projection.get("candidate_tables", []) or []:
+                if isinstance(candidate, dict):
+                    ontology_terms |= _recall_tokens(candidate.get("name"))
+            for candidate in projection.get("candidate_columns", []) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                ontology_terms |= _recall_tokens(candidate.get("property"))
+                for value in candidate.get("candidates", []) or []:
+                    ontology_terms |= _recall_tokens(value)
+        question_terms = {
+            token for token in _recall_tokens(question) if len(token) > 2
+        }
+        return ontology_terms - _RECALL_STOPWORDS, question_terms - _RECALL_STOPWORDS
+
+    def select_candidate_tables(
+        self,
+        question: str,
+        ontology_context: str,
+    ) -> dict[str, Any]:
+        """Recall the tables this question needs instead of loading the whole schema."""
+        summaries = self._index_summaries()
+        if not summaries:
+            return {"selected": [], "total": 0, "basis": "empty_catalog"}
+
+        cached = {
+            str(detail.get("full_name") or "").casefold(): detail
+            for detail in self.catalog_service.cached_table_details()
+        }
+        ontology_terms, question_terms = self._recall_terms(question, ontology_context)
+
+        scored: list[tuple[float, str]] = []
+        for summary in summaries:
+            full_name = str(summary.get("full_name") or "")
+            if not full_name:
+                continue
+            name_tokens = _recall_tokens(summary.get("name")) | _recall_tokens(
+                summary.get("comment")
+            )
+            column_tokens: set[str] = set()
+            detail = cached.get(full_name.casefold())
+            if detail:
+                for column in detail.get("columns") or []:
+                    if isinstance(column, dict):
+                        column_tokens |= _recall_tokens(column.get("name"))
+                        column_tokens |= _recall_tokens(column.get("comment"))
+            # UC names are lower-case run-together words while ontology names are camel
+            # case, so token equality alone never matches; compare against the compact form.
+            name_compact = "".join(sorted(name_tokens))
+            column_compact = "".join(sorted(column_tokens))
+            score = 0.0
+            score += 3.0 * len(ontology_terms & name_tokens)
+            score += 2.0 * len(ontology_terms & column_tokens)
+            score += 2.0 * len(question_terms & name_tokens)
+            score += 1.0 * len(question_terms & column_tokens)
+            score += 2.0 * _compact_hits(ontology_terms, name_compact)
+            score += 1.0 * _compact_hits(ontology_terms, column_compact)
+            score += 1.0 * _compact_hits(question_terms, name_compact)
+            if score > 0:
+                scored.append((score, full_name))
+
+        if not scored:
+            # No lexical anchor: fall back to the whole small schema rather than guess.
+            if len(summaries) <= DatabricksConfig.METADATA_SNAPSHOT_MAX_TABLES:
+                return {
+                    "selected": [str(item.get("full_name")) for item in summaries],
+                    "total": len(summaries),
+                    "basis": "no_match_full_schema",
+                }
+            return {"selected": [], "total": len(summaries), "basis": "no_match"}
+
+        scored.sort(key=lambda item: (-item[0], item[1].casefold()))
+        selected = [
+            full_name
+            for _, full_name in scored[: DatabricksConfig.METADATA_CANDIDATE_MAX_TABLES]
+        ]
+        return {
+            "selected": selected,
+            "total": len(summaries),
+            "basis": "recall",
+            "summaries": summaries,
+        }
+
+    @staticmethod
+    def _entity_matches_table(stem: str, table_token: str) -> bool:
+        """Match a foreign-key stem to a table name across domain and role prefixes."""
+        if not stem or not table_token:
+            return False
+        if table_token == stem or table_token.startswith(stem) or table_token.endswith(stem):
+            return True
+        # `ShipToAddressID` and `salesaddress` share only the entity noun, so compare
+        # the common tail rather than requiring one name to contain the other.
+        limit = min(len(stem), len(table_token))
+        common = 0
+        while common < limit and stem[-1 - common] == table_token[-1 - common]:
+            common += 1
+        return common >= _ENTITY_NOUN_MIN
+
+    @classmethod
+    def _join_closure(
+        cls,
+        details: list[dict[str, Any]],
+        summaries: list[dict[str, Any]],
+        selected: set[str],
+    ) -> list[str]:
+        """Add tables a selected table must join through, keyed by identifier suffix."""
+        by_name = {
+            str(item.get("full_name") or "").casefold(): str(item.get("full_name") or "")
+            for item in summaries
+        }
+        missing: list[str] = []
+        for detail in details:
+            for column in detail.get("columns") or []:
+                if not isinstance(column, dict):
+                    continue
+                column_name = str(column.get("name") or "")
+                if len(column_name) < _ID_SUFFIX_MIN or not column_name.casefold().endswith("id"):
+                    continue
+                stem = column_name[:-2].casefold()
+                for key, full_name in by_name.items():
+                    if full_name.casefold() in selected or full_name in missing:
+                        continue
+                    if cls._entity_matches_table(stem, key.rsplit(".", 1)[-1]):
+                        missing.append(full_name)
+                        if len(missing) >= DatabricksConfig.METADATA_CANDIDATE_MAX_TABLES:
+                            return missing
+        return missing
+
+    def prefetch_candidate_schema(
+        self,
+        tool_results: list[dict[str, Any]],
+        *,
+        question: str,
+        ontology_context: str,
+    ) -> dict[str, Any]:
+        """Resolve, fetch and record the candidate tables before the model runs."""
+        recall = self.select_candidate_tables(question, ontology_context)
+        selected = list(recall.get("selected") or [])
+        if not selected:
+            return recall
+
+        details, cache_hits = self.catalog_service.get_tables_details(selected)
+        summaries = recall.get("summaries") or self._index_summaries()
+        closure = self._join_closure(
+            details,
+            summaries,
+            {name.casefold() for name in selected},
+        )
+        if closure:
+            extra, extra_hits = self.catalog_service.get_tables_details(closure)
+            details.extend(extra)
+            cache_hits += extra_hits
+            selected.extend(closure)
+
+        tool_results.append(
+            {
+                "tool": "list_tables",
+                "origin": "deterministic",
+                "arguments": {
+                    "catalog": DatabricksConfig.CATALOG,
+                    "schema": ", ".join(DatabricksConfig.SCHEMAS),
+                },
+                "result": {
+                    "status": "ok",
+                    "table_count": recall.get("total", len(summaries)),
+                    "tables": [str(item.get("full_name") or "") for item in summaries],
+                    "selected_tables": [
+                        str(table.get("full_name") or "") for table in details
+                    ],
+                    "selection_basis": recall.get("basis"),
+                    "join_closure_tables": closure,
+                    "source": "deterministic_schema_snapshot",
+                },
+            }
+        )
+        for table in details:
+            tool_results.append(self._table_detail_record(table, cache_hit=True))
+
+        recall["selected"] = [str(table.get("full_name") or "") for table in details]
+        recall["cache_hits"] = cache_hits
+        logger.info(
+            "Metadata recall selected %s of %s table(s) (basis=%s, join closure=%s)",
+            len(details),
+            recall.get("total"),
+            recall.get("basis"),
+            len(closure),
+        )
+        return recall
+
     def supplement_schema_snapshot(
         self,
         tool_results: list[dict[str, Any]],
         *,
-        max_tables: int = 40,
+        max_tables: int = 0,
     ) -> int:
         """Add cached UC details for tables the verifier model failed to inspect."""
+        limit = max_tables or DatabricksConfig.METADATA_SNAPSHOT_MAX_TABLES
         existing = {
             str((item.get("result") or {}).get("full_name") or "").casefold()
             for item in tool_results
             if item.get("tool") == "get_table_details"
             and isinstance(item.get("result"), dict)
         }
-        table_summaries: list[dict[str, Any]] = []
-        for schema in DatabricksConfig.SCHEMAS:
-            tables, _ = self.catalog_service.list_tables(
-                catalog=DatabricksConfig.CATALOG,
-                schema=schema,
-            )
-            table_summaries.extend(tables)
-        if len(table_summaries) > max_tables:
+        required = self._recalled_table_names(tool_results)
+        if required:
+            wanted = [name for name in required if name.casefold() not in existing]
+            if not wanted:
+                return 0
+            details, _ = self.catalog_service.get_tables_details(wanted)
+            for table in details:
+                tool_results.append(self._table_detail_record(table, cache_hit=True))
+            if details:
+                logger.info(
+                    "Deterministic metadata snapshot supplemented %s recalled table(s)",
+                    len(details),
+                )
+            return len(details)
+
+        table_summaries = self._index_summaries()
+        if len(table_summaries) > limit:
             logger.info(
                 "Skipping deterministic metadata snapshot: %s tables exceeds limit %s",
                 len(table_summaries),
-                max_tables,
+                limit,
             )
             return 0
 
-        added = 0
-        for summary in table_summaries:
-            full_name = str(summary.get("full_name") or "")
-            if not full_name or full_name.casefold() in existing:
-                continue
-            schema = str(summary.get("schema") or "")
-            table_name = str(summary.get("name") or "")
-            table, cache_hit = self.catalog_service.get_table(
-                table_name,
-                catalog=DatabricksConfig.CATALOG,
-                schema=schema,
+        wanted = [
+            str(summary.get("full_name") or "")
+            for summary in table_summaries
+            if str(summary.get("full_name") or "").casefold() not in existing
+        ]
+        details, _ = self.catalog_service.get_tables_details(
+            [name for name in wanted if name]
+        )
+        for table in details:
+            tool_results.append(self._table_detail_record(table, cache_hit=True))
+        if details:
+            logger.info(
+                "Deterministic metadata snapshot supplemented %s table(s)",
+                len(details),
             )
-            if table is None:
-                continue
-            tool_results.append(
-                {
-                    "tool": "get_table_details",
-                    "arguments": {
-                        "table_name": table_name,
-                        "catalog": DatabricksConfig.CATALOG,
-                        "schema": schema,
-                    },
-                    "result": {
-                        "status": "ok",
-                        **table,
-                        "column_count": len(table.get("columns") or []),
-                        "source": "deterministic_schema_snapshot",
-                        "cache_hit": cache_hit,
-                    },
-                }
-            )
-            existing.add(full_name.casefold())
-            added += 1
-        if added:
-            logger.info("Deterministic metadata snapshot supplemented %s table(s)", added)
-        return added
+        return len(details)
 
     @classmethod
     def _with_ontology_verification_context(
@@ -863,11 +1176,69 @@ class MetadataAgent:
             return (
                 "<metadata_discovery_mode>\n"
                 "required_skill=metadata-mapping\n"
-                "Load this Skill progressively before the first Unity Catalog tool call.\n"
+                "Load this Skill progressively before returning any decision, including when\n"
+                "<verified_schema_snapshot> removes the need for a Unity Catalog tool call.\n"
                 "</metadata_discovery_mode>\n\n"
                 f"{contextual_question}"
             )
         return contextual_question
+
+    @staticmethod
+    def _render_schema_snapshot(tool_results: list[dict[str, Any]]) -> str:
+        """Render already-fetched UC details compactly enough to prefill the model context."""
+        lines: list[str] = []
+        for item in tool_results:
+            if item.get("tool") != "get_table_details":
+                continue
+            table = item.get("result")
+            if not isinstance(table, dict):
+                continue
+            full_name = str(table.get("full_name") or "")
+            if not full_name:
+                continue
+            comment = " ".join(str(table.get("comment") or "").split())
+            lines.append(f"{full_name}" + (f" — {comment}" if comment else ""))
+            for column in table.get("columns") or []:
+                if not isinstance(column, dict):
+                    continue
+                column_type = str(column.get("type") or "").split(".")[-1].lower()
+                column_comment = " ".join(str(column.get("comment") or "").split())
+                nullable = "" if column.get("nullable", True) else " not null"
+                lines.append(
+                    f"  {column.get('name')} {column_type}{nullable}"
+                    + (f" — {column_comment}" if column_comment else "")
+                )
+        if not lines:
+            return ""
+        body = "\n".join(lines)
+        return (
+            "<verified_schema_snapshot source=\"unity_catalog\" complete=\"true\">\n"
+            f"{body}\n"
+            "</verified_schema_snapshot>\n\n"
+        )
+
+    def _with_schema_snapshot(
+        self,
+        contextual_question: str,
+        sink: list[dict[str, Any]],
+        *,
+        question: str,
+        ontology_context: str,
+    ) -> str:
+        """Prefetch only the tables this question recalls, so discovery rounds are unnecessary."""
+        recall = self.prefetch_candidate_schema(
+            sink,
+            question=question,
+            ontology_context=ontology_context,
+        )
+        snapshot = self._render_schema_snapshot(sink)
+        if not snapshot:
+            return contextual_question
+        header = (
+            f"selected {len(recall.get('selected') or [])} of {recall.get('total', 0)} "
+            f"table(s) by {recall.get('basis', 'recall')}"
+        )
+        return f"<!-- {header} -->\n{snapshot}{contextual_question}"
 
     async def query(
         self,
@@ -879,7 +1250,7 @@ class MetadataAgent:
     ) -> str:
         """
         Retrieve schema metadata relevant to *question*.
-        Returns a YAML/markdown schema context block.
+        Returns MetadataAgent's verification decisions plus every raw tool payload.
         """
         logger.info(f"MetadataAgent.query: '{question[:80]}'")
         sink = context_sink if context_sink is not None else []
@@ -890,6 +1261,12 @@ class MetadataAgent:
                 question,
                 ontology_context=ontology_context,
                 require_metadata_mapping=require_metadata_mapping,
+            )
+            contextual_question = self._with_schema_snapshot(
+                contextual_question,
+                sink,
+                question=question,
+                ontology_context=ontology_context,
             )
             result = await run_agent(
                 selected_agent,
@@ -920,6 +1297,12 @@ class MetadataAgent:
                 question,
                 ontology_context=ontology_context,
                 require_metadata_mapping=require_metadata_mapping,
+            )
+            contextual_question = self._with_schema_snapshot(
+                contextual_question,
+                sink,
+                question=question,
+                ontology_context=ontology_context,
             )
             async for update in stream_agent(
                 selected_agent,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -163,6 +165,48 @@ class MetadataCatalogService:
             schema=schema,
         )
         return self._matching_tables(tables, keyword), cache_hit
+
+    def cached_table_details(self) -> list[dict[str, Any]]:
+        """Return unexpired table details already held, without contacting Unity Catalog."""
+        with self._lock:
+            return [
+                deepcopy(entry.value)
+                for entry in self._table_detail_cache.values()
+                if self._is_fresh(entry)
+            ]
+
+    def get_tables_details(
+        self,
+        table_names: Sequence[str],
+        *,
+        catalog: str = "",
+        schema: str = "",
+        max_workers: int = 8,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Fetch several tables' columns in one pass; requests run concurrently."""
+        requested = list(dict.fromkeys(name for name in table_names if name))
+        if not requested:
+            return [], 0
+
+        def fetch(name: str) -> tuple[str, Optional[dict[str, Any]], bool]:
+            table, cache_hit = self.get_table(name, catalog=catalog, schema=schema)
+            return name, table, cache_hit
+
+        results: dict[str, tuple[Optional[dict[str, Any]], bool]] = {}
+        workers = max(1, min(max_workers, len(requested)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for name, table, cache_hit in pool.map(fetch, requested):
+                results[name] = (table, cache_hit)
+
+        details = []
+        cache_hits = 0
+        for name in requested:
+            table, cache_hit = results.get(name, (None, False))
+            if table is None:
+                continue
+            details.append(table)
+            cache_hits += int(cache_hit)
+        return details, cache_hits
 
     def rewrite_sql_identifiers(
         self,

@@ -11,7 +11,7 @@ from pydantic import Field
 
 from ..config import AgentReasoningConfig, AzureOpenAIConfig, OntologyConfig
 from ..ontology import OntologyService
-from ..prompts import ONTOLOGY_AGENT_PROMPT
+from ..prompts import ONTOLOGY_AGENT_PROMPT, ONTOLOGY_ROUTER_PROMPT
 from ..skills_provider import create_skills_provider
 from ..utils import get_logger
 from .maf_runtime import (
@@ -41,6 +41,7 @@ class OntologyAgent:
             default=None,
         )
         self.agent = self._create_agent(self._create_tools())
+        self.router_agent = self._create_router_agent()
         logger.info("OntologyAgent '%s' initialised successfully.", agent_id)
 
     @staticmethod
@@ -369,17 +370,80 @@ class OntologyAgent:
             f"- Reasoner: {health['reasoner']} ({health['reasoning_status']})\n"
             "- Queries are read-only and physical mappings require MetadataAgent verification.\n"
         )
-        skills_provider = create_skills_provider("OntologyAgent")
         return create_maf_agent(
             name="OntologyAgent",
             instructions=ONTOLOGY_AGENT_PROMPT + runtime_context,
             tools=tools,
+            reasoning_effort=AgentReasoningConfig.ONTOLOGY,
+            model=AzureOpenAIConfig.GPT_DEPLOYMENT,
+            max_iterations=OntologyConfig.AGENT_MAX_MODEL_ROUNDTRIPS,
+            max_function_calls=OntologyConfig.AGENT_MAX_FUNCTION_CALLS,
+        )
+
+    def _create_router_agent(self):
+        """Create the tool-free stage that only decides governed-Skill routing."""
+        skills_provider = create_skills_provider("OntologyAgent")
+        return create_maf_agent(
+            name="OntologyRouter",
+            instructions=ONTOLOGY_ROUTER_PROMPT,
+            tools=[],
             reasoning_effort=AgentReasoningConfig.ONTOLOGY,
             context_providers=[skills_provider] if skills_provider else None,
             model=AzureOpenAIConfig.GPT_DEPLOYMENT,
             max_iterations=OntologyConfig.AGENT_MAX_MODEL_ROUNDTRIPS,
             max_function_calls=OntologyConfig.AGENT_MAX_FUNCTION_CALLS,
         )
+
+    def collect_deterministic_context(self, question: str) -> dict[str, Any]:
+        """Run the composite lookup in code and record it as if the model had called it."""
+        payload = self.ontology_service.get_business_context(
+            question,
+            root_entity="",
+            max_depth=OntologyConfig.MAX_DEPTH,
+        )
+        self._tool_json(
+            "get_business_context",
+            {
+                "question": question,
+                "root_entity": "",
+                "max_depth": OntologyConfig.MAX_DEPTH,
+            },
+            payload,
+        )
+        # Derived OWL classes are eight rows in total, so they are always cheaper to include
+        # than to let the model discover them one question at a time.
+        self._tool_json("list_defined_classes", {}, self.ontology_service.list_defined_classes())
+        sink = self._tool_result_sink.get()
+        if sink is not None:
+            for item in sink[-2:]:
+                item["origin"] = "deterministic"
+        return payload
+
+    @staticmethod
+    def needs_recovery(payload: dict[str, Any]) -> bool:
+        """Return whether the composite lookup is too weak to hand off unaided."""
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            return True
+        try:
+            confidence = float(payload.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        return confidence < OntologyConfig.ESCALATION_MIN_CONFIDENCE
+
+    @staticmethod
+    def _routed_to_governed_skill(text: str) -> bool:
+        summary = (text or "").strip()
+        if summary.startswith("```"):
+            summary = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                summary,
+                flags=re.IGNORECASE,
+            ).strip()
+        try:
+            return json.loads(summary).get("route") == "governed_skill"
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return False
 
     def get_new_thread(self):
         """Create a new MAF conversation session."""
@@ -649,12 +713,22 @@ class OntologyAgent:
         sink = context_sink if context_sink is not None else []
         token = self._tool_result_sink.set(sink)
         try:
-            result = await run_agent(
+            routed = await run_agent(
+                self.router_agent,
+                self._with_schema_context(question, schema_context),
+            )
+            route_text = routed.text or ""
+            if self._routed_to_governed_skill(route_text):
+                return self.build_collected_context(route_text, sink)
+            payload = self.collect_deterministic_context(question)
+            if not self.needs_recovery(payload):
+                return self.build_collected_context("", sink)
+            recovered = await run_agent(
                 self.agent,
                 self._with_schema_context(question, schema_context),
                 session=thread,
             )
-            return self.build_collected_context(result.text, sink)
+            return self.build_collected_context(recovered.text, sink)
         finally:
             self._tool_result_sink.reset(token)
 
@@ -665,10 +739,28 @@ class OntologyAgent:
         schema_context: str = "",
         context_sink: Optional[list[dict[str, Any]]] = None,
     ):
-        """Stream OntologyAgent model and tool updates."""
+        """Stream governed-Skill routing, then hand off deterministic ontology evidence."""
         sink = context_sink if context_sink is not None else []
         token = self._tool_result_sink.set(sink)
         try:
+            route_text: list[str] = []
+            async for update in stream_agent(
+                self.router_agent,
+                self._with_schema_context(question, schema_context),
+            ):
+                if getattr(update, "text", ""):
+                    route_text.append(update.text)
+                yield update
+            if self._routed_to_governed_skill("".join(route_text)):
+                return
+            payload = self.collect_deterministic_context(question)
+            if not self.needs_recovery(payload):
+                return
+            logger.info(
+                "Ontology composite context is weak (status=%s, confidence=%s); escalating.",
+                payload.get("status"),
+                payload.get("confidence"),
+            )
             async for update in stream_agent(
                 self.agent,
                 self._with_schema_context(question, schema_context),
