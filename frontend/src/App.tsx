@@ -184,7 +184,7 @@ const normalizeCitationsForDisplay = (content: string): string => {
     }
   }
 
-  for (const m of refsText.matchAll(/\[(\d+)\]\s+([^\n\[][^\n]*)/g)) {
+  for (const m of refsText.matchAll(/\[(\d+)\]\s+((?!\[)[^\n]+)/g)) {
     const num = m[1];
     if (!refsMap.has(num)) {
       refsMap.set(num, { title: (m[2] || '').trim() || `Reference ${num}`, url: '' });
@@ -377,6 +377,7 @@ function App() {
       initialSessionRequestedRef.current = true;
       initializeApplication();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- initialization is mount-only
   }, []);
 
   useEffect(() => {
@@ -732,10 +733,9 @@ function App() {
       };
 
       if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
+        let chunk = await reader.read();
+        while (!chunk.done) {
+          const { value } = chunk;
           sseBuffer += decoder.decode(value, { stream: true });
           const rawEvents = sseBuffer.split('\n\n');
           sseBuffer = rawEvents.pop() || '';
@@ -754,6 +754,7 @@ function App() {
               console.error('Error parsing SSE data:', e);
             }
           }
+          chunk = await reader.read();
         }
 
         // Flush any trailing SSE payload still in the buffer
@@ -1013,6 +1014,7 @@ function App() {
                               urlTransform={(url) => url}
                               components={{
                                 a: ({ href, node, children, ...props }) => {
+                                  void node;
                                   const childArr = React.Children.toArray(children);
                                   const onlyImg =
                                     childArr.length === 1 &&

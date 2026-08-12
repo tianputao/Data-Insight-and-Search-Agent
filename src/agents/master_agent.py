@@ -364,9 +364,22 @@ class MasterAgent:
                 if not name:
                     continue
                 item["activity_emitted"] = True
-                # Per-table rows would imply the answer needs every prefetched table, so the
-                # batch is reported once through the listing that selected it.
-                if name != "list_tables":
+                # Per-table Metadata rows would imply the answer needs every prefetched table,
+                # so that batch is reported once. Ontology lookups remain individually visible.
+                if agent == "MetadataAgent" and name != "list_tables":
+                    continue
+                if agent != "MetadataAgent":
+                    arguments = json.dumps(item.get("arguments") or {}, ensure_ascii=False)
+                    call_id = push_tool_start(name, arguments, "", agent, parent_id)
+                    push_tool_end(
+                        call_id,
+                        name,
+                        arguments,
+                        agent,
+                        parent_id,
+                        result=item.get("result"),
+                    )
+                    emitted += 1
                     continue
                 result = item.get("result") or {}
                 selected = [

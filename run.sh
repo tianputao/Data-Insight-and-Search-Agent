@@ -16,8 +16,19 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_ROOT}/venv"
 FRONTEND_DIR="${PROJECT_ROOT}/frontend"
 ENV_FILE="${PROJECT_ROOT}/.env"
-BACKEND_PORT="${BACKEND_PORT:-8000}"
-FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+
+read_numeric_env() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "${ENV_FILE}" ]]; then
+    value="$(sed -n "s/^${key}=\([0-9][0-9]*\).*$/\1/p" "${ENV_FILE}" | tail -n1)"
+  fi
+  printf '%s' "${value:-${fallback}}"
+}
+
+BACKEND_PORT="${BACKEND_PORT:-$(read_numeric_env BACKEND_PORT 8000)}"
+FRONTEND_PORT="${FRONTEND_PORT:-$(read_numeric_env FRONTEND_PORT 3000)}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
@@ -118,12 +129,6 @@ start_backend() {
     exit 1
   fi
 
-  # Export .env into the shell so uvicorn picks up the variables
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
-  set +a
-
   exec uvicorn src.api.main:app \
     --host 0.0.0.0 \
     --port "${BACKEND_PORT}" \
@@ -184,10 +189,6 @@ start_full_stack() {
     (
       cd "${PROJECT_ROOT}"
       activate_venv
-      set -a
-      # shellcheck source=/dev/null
-      source "${ENV_FILE}"
-      set +a
       uvicorn src.api.main:app \
         --host 0.0.0.0 \
         --port "${BACKEND_PORT}" \

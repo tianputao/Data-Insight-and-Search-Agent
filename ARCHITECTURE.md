@@ -29,7 +29,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │  └──────────────────┘  └────────────────┘  └─────────────────┘  │
 │  ┌──────────────────┐  ┌────────────────┐                        │
 │  │delegate_metadata │  │delegate_data   │  SkillsProvider scopes   │
-│  │                  │  │_insight        │  skills per sub-agent    │
+│  │                  │  │_analysis       │  skills per sub-agent    │
 │  └──────────────────┘  └────────────────┘                        │
 └──────────────────────────────┬───────────────────────────────────┘
                                      │
@@ -39,7 +39,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │ SearchAgent │ OntologyAgent │ MetadataAgent │ DataInsightAgent    │
 │ Azure Search│ Owlready2     │ Unity Catalog │ Databricks SQL      │
 │                                                                  │
-│ Analytics: OntologyAgent? → MetadataAgent → DataInsight          │
+│ Analytics: OntologyRouter? → OWL lookup → Metadata → DataInsight │
 │ Ontology failure: visible fallback → MetadataAgent → DataInsight │
 └──────────────────────────────┬───────────────────────────────────┘
                                      │
@@ -60,7 +60,7 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 │  │   3-large (3072d) │  └───────────────────────────────────┘   │
 │  └───────────────────┘  ┌───────────────────────────────────┐   │
 │                          │  Azure AI Foundry                 │   │
-│                          │  Monitoring & Evaluation          │   │
+│                          │  Optional external evaluation     │   │
 │                          └───────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -103,15 +103,14 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 | `thinking` | `{"message": "..."}` | Agent reasoning step |
 | `text` | `{"content": "..."}` | Response token chunk |
 | `answer_reset` | `{}` | Retract text when a following tool call proves it was working narration |
-| `refs` | `{num: [title, url]}` | Citation map from tool calls |
-| `done` | — | Stream complete |
+| `done` | `{"content": "<normalized final answer>"}` | Stream complete; authoritative final answer |
 | `stopped` | `{"message": "..."}` | Current thread task was cancelled by the user |
 | `error` | `{"message": "..."}` | Error description |
 
 **Citation pipeline**:
-1. `search_knowledge` tool pushes a `refs` dict to the SSE queue on every search call
+1. `search_knowledge` pushes reference evidence into the request-local internal queue
 2. Backend `_extract_search_references` and `_normalize_citations_and_references` merge and format citations (preserving documents without a URL as plain-text footnotes)
-3. Frontend `normalizeCitationsForDisplay()` renders `[n] [title](url)` (linked) or `[n] title` (plain)
+3. The final normalized answer is returned in `done.content`; frontend `normalizeCitationsForDisplay()` renders `[n] [title](url)` (linked) or `[n] title` (plain)
 
 **Lifecycle**: A single `MasterAgent` is created at startup, while each browser thread owns an isolated MAF `AgentSession`. Each user turn creates a request-local `QueryEngineContext`; `ContextVar` propagation keeps tool outcomes, search attempts, original intent, and the SSE sink isolated across concurrent sessions. Agent-scoped native `SkillsProvider` instances advertise and load repository Skills.
 
@@ -155,10 +154,10 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 
 **Tools**: `search_knowledge_base` (single query), `parallel_search` (multi-query concurrent)
 
-**Search modes** (toggled per request):
+**Search modes** (configured when the backend creates SearchAgent):
 - **Hybrid** (always on): vector similarity (text-embedding-3-large) + BM25 keyword
-- **Semantic reranking** (`DEFAULT_ENABLE_SEMANTIC_RERANKER`): Azure semantic reranker
-- **Agentic retrieval** (`DEFAULT_ENABLE_AGENTIC_RETRIEVAL`): Azure-managed query planning
+- **Semantic reranking** (`DEFAULT_ENABLE_SEMANTIC_RERANKER`): Azure semantic reranker; restart after changing the environment value
+- **Agentic retrieval** (`DEFAULT_ENABLE_AGENTIC_RETRIEVAL`): Azure-managed query planning; restart after changing the environment value
 
 **Index schema** (`index-dev-figure-01-chunk`):
 - Core fields: `id`, `session_id`, `content`, `title`, `filepath`, `url`, `metadata`, `doc_metadata`, `description`
@@ -171,7 +170,9 @@ This matches the central Claude QueryEngine control path while retaining MAF's n
 
 ### 5. OntologyAgent (`src/agents/ontology_agent.py`)
 
-**Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. HermiT reasoning is enabled by default and can be disabled via `ONTOLOGY_ENABLE_REASONER=false`.
+**Backend**: Owlready2 with a dedicated in-memory `World`. The service recursively loads `Ontology/**/*.owl` in read-only mode and builds normalized entity and graph indexes. HermiT startup reasoning is disabled by default; enable it with `ONTOLOGY_ENABLE_REASONER=true` and Java 11+.
+
+**Runtime path**: `OntologyRouter` uses the primary model only to evaluate the progressively disclosed `analytics-spec` governed Skill. If no governed route matches, code calls `get_business_context` and `list_defined_classes` directly. A non-`ok` result or confidence below `ONTOLOGY_ESCALATION_MIN_CONFIDENCE` escalates to the full OntologyAgent tool loop. This keeps normal semantic lookup deterministic while preserving model-driven recovery for weak results.
 
 **Tools**: `search_entities`, `describe_entity`, `expand_neighbors`, `find_paths`, `find_related_by_type`, `get_schema_mapping`, `get_join_paths`, `get_lineage`, `get_semantic_candidates`, `list_defined_classes`, and `get_business_context`.
 
@@ -185,7 +186,7 @@ HermiT may reject ontology datatypes outside its OWL 2 datatype map. A reasoner 
 
 ### 6. DataInsightAgent (`src/agents/data_insight_agent.py`)
 
-**Backend**: Azure Databricks Unity Catalog via JDBC (databricks-sql-connector)
+**Backend**: Azure Databricks SQL Warehouse via `databricks-sql-connector`; Unity Catalog metadata is supplied by MetadataAgent.
 
 **Tools**:
 
@@ -196,11 +197,11 @@ HermiT may reject ontology datatypes outside its OWL 2 datatype map. A reasoner 
 | `recover_ontology_context` | Exceptional, once-per-request OntologyAgent recovery when ontology was enabled but context is unexpectedly missing |
 | Native Skills | `SkillsProvider` advertises governed templates plus `sql-planning` on demand |
 
-**Configuration**: `DatabricksConfig` — `HOST`, `TOKEN`, `HTTP_PATH`, `CATALOG`, `SCHEMAS` (comma-separated list), `MAX_ROWS`, `QUERY_TIMEOUT`. The agent is only instantiated when `DatabricksConfig.is_configured()` returns `True`.
+**Configuration**: `DatabricksConfig` — `HOST`, `TOKEN`, `HTTP_PATH`, `CATALOG`, `SCHEMAS` (comma-separated list), `MAX_ROWS`, `QUERY_TIMEOUT`. The agent is instantiated at startup; its SQL tool returns a configuration error when `DatabricksConfig.is_configured()` is false.
 
 ### 7. MetadataAgent (`src/agents/metadata_agent.py`)
 
-**Backend**: Azure Databricks Unity Catalog via JDBC
+**Backend**: Azure Databricks Unity Catalog via `databricks-sdk`
 
 **Tools**:
 
@@ -214,11 +215,13 @@ HermiT may reject ontology datatypes outside its OWL 2 datatype map. A reasoner 
 
 MetadataAgent remains necessary after adding OntologyAgent: ontology semantics identify business concepts and paths first, while Unity Catalog is the authority for executable table names, columns, keys, join cardinality, and availability. MasterAgent owns the canonical Ontology artifact and passes it directly to DataInsightAgent; MetadataAgent receives a bounded verification projection and cannot replace or discard the semantic context.
 
-For analytics, MetadataAgent retains its native MAF model/tool loop. The model searches or lists candidate tables from the current question, then retrieves details only for selected tables. Process-local TTL caches are keyed by catalog, schema table-list, and fully-qualified table detail; they avoid repeated network reads of the same UC object without bypassing the agent loop. DataInsightAgent receives the agent summary plus every raw tool result from that run. The normal path never repeats MetadataAgent; a bounded recovery tool is available only when the DataInsight LLM identifies a concrete missing or incomplete handoff.
+For analytics, code first lists cached table summaries (bounded by `METADATA_INDEX_MAX_TABLES`), scores them against the question and ontology terms, and batch-fetches up to `METADATA_CANDIDATE_MAX_TABLES` details with a bounded thread pool. Identifier-based join closure may add bridge tables. When recall finds nothing, schemas no larger than `METADATA_SNAPSHOT_MAX_TABLES` use a complete snapshot; larger schemas leave discovery to the MetadataAgent tools. The snapshot is a candidate subset, so the model can still call `search_tables` or `get_table_details` to close a named gap.
+
+MetadataAgent then performs one discovery/verification turn: ontology-disabled discovery progressively loads `metadata-mapping`; ontology-enabled verification has no Skill provider. It returns selected tables, verified joins, Skill-only business mappings, rejected candidates, and unresolved terms without copying raw columns. DataInsightAgent receives that decision JSON plus every authoritative raw UC payload. Process-local TTL caches are keyed by catalog, schema table list, and fully qualified table detail.
 
 ### 8. Skill System
 
-**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. OntologyAgent receives governed template routing Skills; DataInsightAgent receives those governed Skills plus `sql-planning`; Metadata discovery receives `metadata-mapping`; Metadata verification, MasterAgent, and SearchAgent receive no data Skills.
+**SkillsProvider factory** (`src/skills_provider.py`): Creates agent-scoped native MAF providers backed by `FileSkillsSource`. OntologyRouter receives governed template routing Skills; DataInsightAgent receives those governed Skills plus `sql-planning`; Metadata discovery receives `metadata-mapping`; Ontology recovery, Metadata verification, MasterAgent, and SearchAgent receive no data Skills.
 
 MAF applies progressive disclosure: advertise Skill metadata, load `SKILL.md` on demand, then optionally read resources or execute approval-gated scripts.
 
@@ -273,14 +276,14 @@ AzureAISearchTool.search()
   ├── Semantic reranking (optional)
   └── Return top-K results with titles, URLs, content
       ↓
-MasterAgent: push "refs" event to SSE queue
+MasterAgent: collect references in the request-local queue
       ↓
 MasterAgent: synthesize answer with retrieved context
       ↓
 Stream answer tokens immediately
       └── if a later tool call follows, send answer_reset and classify prior text as narration
       ↓
-SSE stream: thinking → text chunks → refs → done
+SSE stream: thinking → text chunks → thinking_done → done
       ↓
 Frontend: render answer + citations
 ```
@@ -297,7 +300,7 @@ Ontology enabled for this session?
       └── Yes → OntologyAgent resolves role-neutral properties, restrictions, semantic paths, and lineage
               ├── success → MetadataAgent verifies the ontology-derived physical candidates
               └── failure → emit visible fallback, then run ordinary MetadataAgent lookup
-      └── get_table_details runs only for selected candidates; object cache may serve it
+      └── deterministic recall batch-fetches candidates; Metadata tools may close named gaps
       ↓
 DataInsightAgent receives canonical ontology evidence (when available) plus independent authoritative schema context and reconciles both before SQL
       ↓
@@ -329,7 +332,7 @@ AzureOpenAIConfig
 AzureSearchConfig
   ├── ENDPOINT, API_KEY, INDEX_NAME
   ├── 30+ field name mappings (ID_FIELD, CONTENT_FIELD, VECTOR_FIELD, …)
-  ├── BASE_URL + SAS_TOKEN (document Blob Storage)
+      ├── AZURE_BLOB_BASE_URL + AZURE_BLOB_SAS_TOKEN (document Blob Storage)
   ├── IMAGE_BASE_URL + IMAGE_SAS_TOKEN (image Blob Storage)
   └── SEMANTIC_CONFIG_NAME, VECTOR_SEARCH_PROFILE
 
@@ -339,16 +342,18 @@ AzureAIFoundryConfig
 DatabricksConfig
   ├── HOST, TOKEN, HTTP_PATH
   ├── CATALOG, SCHEMAS (comma-separated list)
-  ├── MAX_ROWS, QUERY_TIMEOUT
+      ├── MAX_ROWS, QUERY_TIMEOUT, METADATA_CACHE_TTL_SECONDS
+      ├── METADATA_INDEX_MAX_TABLES, METADATA_CANDIDATE_MAX_TABLES
+      ├── METADATA_SNAPSHOT_MAX_TABLES
   └── is_configured() → bool
 
 OntologyConfig
       ├── DIRECTORY, FILE_GLOB, ONLY_LOCAL
       ├── ENABLE_REASONER, REASONER
-      └── MAX_RESULTS, MAX_DEPTH, MAX_PATHS, MAX_NODES, FUZZY_THRESHOLD, AGENT_TIMEOUT_SECONDS
+      └── query limits, FUZZY_THRESHOLD, ESCALATION_MIN_CONFIDENCE, AGENT_TIMEOUT_SECONDS
 
 AppConfig
-  ├── LOG_LEVEL, MAX_SEARCH_RESULTS, DEFAULT_TOP_K
+      ├── LOG_LEVEL, MAX_SEARCH_RESULTS
   ├── DEFAULT_ENABLE_SEMANTIC_RERANKER
   ├── DEFAULT_ENABLE_AGENTIC_RETRIEVAL
       ├── DEFAULT_ENABLE_ONTOLOGY
@@ -382,10 +387,10 @@ For AAD mode, the running identity needs the *Cognitive Services OpenAI User* ro
 - Content: agent decisions, tool calls, SQL queries, search queries, citation collection, errors, startup events
 - Level controlled by `LOG_LEVEL` env var
 
-### Azure AI Foundry
-- Connects via `AZURE_AI_PROJECT_CONNECTION_STRING`
-- Use exported logs for groundedness, relevance, coherence evaluation
-- A/B test semantic reranker and agentic retrieval configurations
+### External evaluation
+- `AZURE_AI_PROJECT_CONNECTION_STRING` is retained as a configuration placeholder; this repository does not currently register a Foundry or Application Insights exporter.
+- Rotating logs can be exported by a deployment-specific pipeline for groundedness, relevance, and coherence evaluation.
+- Feature flags support A/B testing semantic reranker and agentic retrieval configurations.
 
 ## 🔄 Extension Points
 
@@ -411,7 +416,7 @@ For AAD mode, the running identity needs the *Cognitive Services OpenAI User* ro
 ## 🎯 Design Principles
 
 1. **Modularity**: Agents, tools, prompts, config, and skills are fully separated
-2. **Streaming-first**: All agent responses flow through an SSE queue; no blocking waits
+2. **Streaming-first**: User-visible progress and answers flow through SSE; delegated workers use bounded waits and cooperative cancellation
 3. **Configurable auth**: `AUTH_MODE` supports both API key and AAD without code changes
 4. **Skill injection**: Domain expertise is externalized to `skills/` Markdown files
 5. **Citation integrity**: References preserved even when no public URL is available

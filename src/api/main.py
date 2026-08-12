@@ -8,15 +8,21 @@ POST  /threads/new          Create a new conversation thread
 GET   /threads              List all active threads
 GET   /threads/{id}/history Get message history for a thread
 DELETE /threads/{id}        Delete a thread
+POST  /threads/{id}/stop    Stop the active run for one thread
 GET   /business-layer       Read the workspace business semantic document
 PUT   /business-layer       Save the workspace business semantic document
 GET   /skills               List available skills
+GET   /config               Return non-sensitive runtime capability defaults
+GET   /proxy-image          Proxy allowlisted Azure Blob images
 GET   /health               Health check
 
 SSE event format (matches what the frontend expects)
 ----------------------------------------------------
 data: {"type": "thinking", "message": "<step description>"}
 data: {"type": "text",     "content": "<response chunk>"}
+data: {"type": "answer_reset"}
+data: {"type": "thinking_done"}
+data: {"type": "stopped",  "message": "<stop description>"}
 data: {"type": "done"}
 data: {"type": "error",    "message": "<error description>"}
 
@@ -24,7 +30,7 @@ Architecture
 ------------
 * A single MasterAgent is created at startup and shared across all requests.
 * Thread objects are stored in an in-memory dict keyed by thread_id (UUID string).
-* The Skill Registry is scanned at startup so all agents get skill context.
+* Agent-scoped native MAF SkillsProvider instances progressively disclose assigned Skills.
 * CORS is configured to allow the Vite dev server (localhost:3000) and production origins.
 """
 
@@ -984,7 +990,7 @@ async def _stream_agent_response(
     def _process_maf_update(update) -> List[str]:
         """Convert one MAF update object → list of SSE strings."""
         nonlocal _pending_call_id, _pending_call_name, _pending_call_args
-        nonlocal search_ref_map, cache_failure_observed
+        nonlocal cache_failure_observed
         events: List[str] = []
 
         # Ordinary assistant text is streamed immediately. If a tool call follows,

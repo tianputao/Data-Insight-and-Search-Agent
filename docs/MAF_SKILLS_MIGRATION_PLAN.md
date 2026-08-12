@@ -1,5 +1,9 @@
 # MAF Native Skills Migration Plan
 
+> **Archived implementation record:** all phases below are complete. Current runtime behavior is
+> documented in `README.md` and `ARCHITECTURE.md`; this file preserves the migration rationale and
+> should not be treated as an outstanding work plan.
+
 ## Goal
 
 Migrate the application from the custom `SkillRegistry` / `SkillInjector` runtime to Microsoft Agent Framework native `SkillsProvider`, while preserving the existing Python agents, React/Vite Activity UI, multi-agent delegation, SSE streaming, Azure AI Search, Databricks analytics, citations, and Anthropic-inspired skill progress experience.

@@ -19,7 +19,7 @@ class AzureOpenAIConfig:
     ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT')
     API_KEY = os.getenv('AZURE_OPENAI_API_KEY')
     AUTH_MODE = os.getenv('AZURE_OPENAI_AUTH_MODE', 'auto').strip().lower()  # auto | key | aad
-    API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview')
+    API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2025-04-01-preview')
     GPT_DEPLOYMENT = os.getenv('AZURE_OPENAI_GPT_DEPLOYMENT', 'gpt-5.1')
     SMALL_GPT_DEPLOYMENT = (
         os.getenv('AZURE_OPENAI_GPT_SMALL_DEPLOYMENT', GPT_DEPLOYMENT).strip()
@@ -265,8 +265,6 @@ class AppConfig:
     
     # Search configuration
     MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '20'))
-    DEFAULT_TOP_K = int(os.getenv('DEFAULT_TOP_K', '20'))
-
     # MasterAgent query engine limits. MAF applies these to one function-invocation loop.
     QUERY_ENGINE_MAX_SEARCH_ATTEMPTS = max(1, int(os.getenv('QUERY_ENGINE_MAX_SEARCH_ATTEMPTS', '2')))
     QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS = max(1, int(os.getenv('QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS', '3')))

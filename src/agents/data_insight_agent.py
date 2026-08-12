@@ -4,8 +4,7 @@ Data Insight Agent — executes analytical SQL / SparkSQL against Azure Databric
 Architecture
 ------------
 * Built on the same Microsoft Agent Framework (MAF) pattern as SearchAgent.
-* Uses MAF OpenAIChatCompletionClient + function tools (no Databricks SDK yet, uses
-  databricks-sql-connector for JDBC-style queries).
+* Uses MAF OpenAIChatCompletionClient + function tools and the Databricks SQL connector.
 * Receives schema context from MetadataAgent (injected as part of the question).
 * MAF SkillsProvider advertises and loads agent-scoped skills on demand.
 
@@ -55,9 +54,9 @@ logger = get_logger(__name__)
 # ─── Databricks connection singleton (avoids per-query cold-start) ────────────
 # Performance note: the biggest latency contributors are:
 #   1. Databricks warehouse cold-start (first connect ~3-10 s, warm ~<1 s)
-#   2. Native MetadataAgent and OntologyAgent model/tool iterations
+#   2. Ontology routing and MetadataAgent verification model turns
 #   3. DataInsightAgent SQL generation and result interpretation
-# Reusing the JDBC connection eliminates the cold-start penalty for subsequent queries.
+# Reusing the SQL connector connection eliminates the cold-start penalty for subsequent queries.
 _db_connection: Optional[Any] = None
 # Re-entrant so a query can hold it across acquisition and execution.
 _db_lock = threading.RLock()

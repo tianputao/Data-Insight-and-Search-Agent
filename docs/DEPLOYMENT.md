@@ -10,19 +10,19 @@ This guide covers deploying the Enterprise Agentic RAG Chatbot to production. Th
 ## 📋 Pre-Deployment Checklist
 
 ### Azure Resources
-- [ ] Azure OpenAI resource with primary and small tool-capable GPT deployments
+- [ ] Azure OpenAI resource with a primary tool-capable GPT deployment and a small Metadata deployment
 - [ ] text-embedding-3-large deployment (3072 dimensions)
 - [ ] Azure AI Search service with semantic search + vector search configured
 - [ ] Search index (`index-dev-figure-01-chunk` schema or equivalent) loaded with data
 - [ ] Azure Blob Storage container (for document URL resolution + SAS token)
 - [ ] Azure Blob Storage container for images (optional)
-- [ ] Azure AI Foundry project (optional, for monitoring)
+- [ ] External log/evaluation destination if required (not wired by this repository)
 - [ ] Azure Databricks workspace with Unity Catalog SQL Warehouse (optional, for DataInsight)
 - [ ] Auth decision: API key (`AZURE_OPENAI_AUTH_MODE=key`) or Managed Identity (`aad`)
 
 ### Application
 - [ ] `.env` configured with all required production values
-- [ ] Python 3.10+ and Node.js 18+ available on deployment target
+- [ ] Python 3.10+ and Node.js 18.18+ available on deployment target
 - [ ] All Python and Node.js dependencies installable
 - [ ] `logs/`, `tmp/`, `data/` directories writable
 - [ ] `data/business_layer.md` persisted on durable storage if the business layer document must survive redeploys (it is git-ignored and node-local)
@@ -75,8 +75,8 @@ az webapp config appsettings set \
     AZURE_SEARCH_ENDPOINT="<value>" \
     AZURE_SEARCH_API_KEY="<value>" \
     AZURE_SEARCH_INDEX_NAME="<value>" \
-    BASE_URL="<blob-base-url>" \
-    SAS_TOKEN="<sas-token>" \
+    AZURE_BLOB_BASE_URL="<blob-base-url>" \
+    AZURE_BLOB_SAS_TOKEN="<sas-token>" \
     DATABRICKS_HOST="<value>" \
     DATABRICKS_TOKEN="<value>" \
     DATABRICKS_HTTP_PATH="<value>" \
@@ -99,7 +99,7 @@ Serve `frontend/dist/` from Azure Static Web Apps or a CDN. Set the backend URL 
 
 ```bash
 # frontend/.env.production
-VITE_API_URL=https://<your-app-name>.azurewebsites.net
+VITE_API_BASE_URL=https://<your-app-name>.azurewebsites.net
 ```
 
 Rebuild: `npm run build`
@@ -119,10 +119,11 @@ RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source (exclude node_modules, venv, __pycache__)
+# Copy runtime assets. Supply secrets through the hosting platform, never the image.
 COPY src/ ./src/
 COPY skills/ ./skills/
-COPY .env .env
+COPY Ontology/ ./Ontology/
+RUN mkdir -p data logs tmp
 
 EXPOSE 8000
 
@@ -141,13 +142,13 @@ az acr build \
 #### 2c. Create a Dockerfile for the React frontend
 
 ```dockerfile
-FROM node:18-alpine AS build
+FROM node:20-alpine AS build
 WORKDIR /app
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ .
-ARG VITE_API_URL
-ENV VITE_API_URL=$VITE_API_URL
+ARG VITE_API_BASE_URL=/api
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
 RUN npm run build
 
 FROM nginx:alpine
@@ -159,7 +160,7 @@ EXPOSE 80
 az acr build \
   --registry <your-acr> \
   --image agentic-rag-frontend:latest \
-  --build-arg VITE_API_URL=https://<backend-fqdn> \
+  --build-arg VITE_API_BASE_URL=https://<backend-fqdn> \
   --file Dockerfile.frontend .
 ```
 
@@ -172,11 +173,12 @@ az containerapp create \
   --name agentic-rag-backend \
   --image <your-acr>.azurecr.io/agentic-rag-backend:latest \
   --target-port 8000 \
-  --ingress internal \
+  --ingress external \
   --env-vars \
     AZURE_OPENAI_ENDPOINT="<value>" \
     AZURE_OPENAI_AUTH_MODE="aad"
-    # ... other env vars
+  # Add the remaining non-secret settings and use Container Apps secrets/secretref
+  # for API keys, SAS tokens, and Databricks credentials.
 
 # Frontend
 az containerapp create \
@@ -186,6 +188,11 @@ az containerapp create \
   --target-port 80 \
   --ingress external
 ```
+
+The static frontend calls the backend from the user's browser, so the backend must be externally
+reachable in this example. To keep backend ingress internal, add a server-side reverse proxy in the
+frontend container and keep `VITE_API_BASE_URL=/api` instead of compiling an internal FQDN into the
+browser bundle.
 
 ## 🔐 Security Hardening
 
@@ -228,14 +235,14 @@ az webapp config appsettings set \
 
 ### SAS Token Rotation
 
-`BASE_URL` and `SAS_TOKEN` (Blob Storage) must be rotated before expiry. Check current expiry:
+`AZURE_BLOB_BASE_URL` and `AZURE_BLOB_SAS_TOKEN` must be rotated before expiry. Check current expiry:
 ```bash
-echo "$SAS_TOKEN" | grep "se="
+echo "$AZURE_BLOB_SAS_TOKEN" | grep "se="
 ```
 
 Update in App Service:
 ```bash
-az webapp config appsettings set ... --settings SAS_TOKEN="<new-sas>"
+az webapp config appsettings set ... --settings AZURE_BLOB_SAS_TOKEN="<new-sas>"
 ```
 
 ### Enable Azure Private Link
@@ -245,20 +252,11 @@ az webapp config appsettings set ... --settings SAS_TOKEN="<new-sas>"
 
 ## 📊 Monitoring Setup
 
-### Application Insights Integration
+### Application Insights / Foundry integration
 
-```bash
-pip install opencensus-ext-azure
-```
-
-Add to `src/utils/logger.py`:
-```python
-from opencensus.ext.azure.log_exporter import AzureLogHandler
-
-logger.addHandler(AzureLogHandler(
-    connection_string='InstrumentationKey=<your-instrumentation-key>'
-))
-```
+This repository currently emits rotating local logs and SSE activity events; it does not register
+an Application Insights or Azure AI Foundry exporter. Add deployment-level log collection or
+instrument the application with Azure Monitor OpenTelemetry before claiming live telemetry.
 
 ### Azure Monitor Alerts
 
@@ -281,32 +279,32 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
     - name: Install Python dependencies
       run: pip install -r requirements.txt
 
-    - name: Run Python compile check
-      run: python -m py_compile src/api/main.py src/agents/master_agent.py
+    - name: Run Python tests
+      run: ONTOLOGY_ENABLE_REASONER=false python -m pytest test_script -q --ignore=test_script/test_search.py -p no:cacheprovider
 
     - name: Set up Node.js
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v4
       with:
-        node-version: '18'
+        node-version: '20'
 
     - name: Build React frontend
       run: |
         cd frontend
         npm ci
-        VITE_API_URL=${{ secrets.BACKEND_URL }} npm run build
+        VITE_API_BASE_URL=${{ secrets.BACKEND_URL }} npm run build
 
     - name: Deploy backend to Azure Web App
-      uses: azure/webapps-deploy@v2
+      uses: azure/webapps-deploy@v3
       with:
         app-name: '<your-app-name>'
         publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
@@ -329,7 +327,7 @@ curl https://<your-backend>/skills
 ```bash
 curl -N -X POST https://<your-backend>/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"message": "hello", "thread_id": "test-1", "enable_semantic_reranker": true}'
+  -d '{"message": "hello", "thread_id": "test-1", "enable_ontology": true}'
 ```
 
 ## 📈 Scaling Considerations
@@ -370,9 +368,9 @@ Use App Service deployment slots or separate resources per environment:
 
 **403 AuthenticationTypeDisabled** — Switch to `AZURE_OPENAI_AUTH_MODE=aad` and assign the correct role to the Managed Identity.
 
-**DataInsight agent unavailable** — Verify `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_HTTP_PATH` are set. Check SQL warehouse is running.
+**DataInsight tools report configuration errors** — Verify `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and `DATABRICKS_HTTP_PATH`; then check that the SQL warehouse is running.
 
-**Citations have no links** — Blob Storage SAS token may be expired or `BASE_URL` is missing. Update `SAS_TOKEN` in app settings.
+**Citations have no links** — Blob Storage SAS token may be expired or `AZURE_BLOB_BASE_URL` is missing. Update `AZURE_BLOB_SAS_TOKEN` in app settings.
 
 **Slow cold start** — Pre-warm the app using App Service "Always On" setting or health-check pings.
 
@@ -380,7 +378,7 @@ Use App Service deployment slots or separate resources per environment:
 
 For production issues:
 1. Check application logs: `logs/application_YYYYMMDD.log`
-2. Review Azure Monitor metrics and Application Insights
+2. Review Azure Monitor or Application Insights only when your deployment has configured that integration
 3. Contact Azure Support for service-level issues
 
 ---

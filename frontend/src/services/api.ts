@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ChatRequest, ChatResponse, RuntimeConfig, SkillInfo, SessionInfo } from '../types';
+import type { RuntimeConfig, SkillInfo, ThreadSummary } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -11,12 +11,6 @@ const apiClient = axios.create({
 });
 
 export const apiService = {
-  // Chat endpoints
-  async sendMessage(request: ChatRequest): Promise<ChatResponse> {
-    const response = await apiClient.post<ChatResponse>('/chat', request);
-    return response.data;
-  },
-
   // Skills endpoints
   async listSkills(): Promise<SkillInfo[]> {
     const response = await apiClient.get<SkillInfo[]>('/skills');
@@ -24,8 +18,8 @@ export const apiService = {
   },
 
   // Thread endpoints
-  async listThreads(): Promise<SessionInfo[]> {
-    const response = await apiClient.get<SessionInfo[]>('/threads');
+  async listThreads(): Promise<ThreadSummary[]> {
+    const response = await apiClient.get<ThreadSummary[]>('/threads');
     return response.data;
   },
 

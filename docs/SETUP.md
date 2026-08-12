@@ -5,10 +5,10 @@
 Before starting, ensure you have:
 
 - ✅ Python 3.10 or higher installed
-- ✅ Node.js 18+ installed (for the React frontend)
+- ✅ Node.js 18.18+ installed (for the React frontend)
 - ✅ Java 11+ installed (for optional HermiT startup reasoning)
 - ✅ Azure subscription with active resources
-- ✅ Azure OpenAI service with primary and small tool-capable GPT deployments
+- ✅ Azure OpenAI service with a primary tool-capable GPT deployment and a small Metadata deployment
 - ✅ Azure AI Search service with semantic search + vector search configured
 - ✅ text-embedding-3-large model deployed (3072 dimensions)
 - ✅ Azure Blob Storage container (for document/image URL resolution)
@@ -50,9 +50,9 @@ cd frontend && npm install && cd ..
    |----------|-------------|
    | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint URL |
    | `AZURE_OPENAI_AUTH_MODE` | `auto` \| `key` \| `aad` (default: `auto`) |
-   | `AZURE_OPENAI_API_KEY` | API key — required when `AUTH_MODE=key` or `auto` |
-   | `AZURE_OPENAI_GPT_DEPLOYMENT` | Primary deployment for MasterAgent and DataInsightAgent |
-   | `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT` | Smaller tool-capable deployment for OntologyAgent and MetadataAgent |
+   | `AZURE_OPENAI_API_KEY` | API key — required for `AUTH_MODE=key`; optional in `auto`, which otherwise uses AAD |
+   | `AZURE_OPENAI_GPT_DEPLOYMENT` | Primary deployment for Master, Search, Ontology routing/recovery, and DataInsight |
+   | `AZURE_OPENAI_GPT_SMALL_DEPLOYMENT` | Smaller tool-capable deployment for Metadata discovery/verification |
    | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Name of your text-embedding-3-large deployment |
    | `AZURE_SEARCH_ENDPOINT` | Azure AI Search endpoint URL |
    | `AZURE_SEARCH_API_KEY` | Azure AI Search admin/query key |
@@ -100,11 +100,11 @@ All field names are overridable via `AZURE_SEARCH_*_FIELD` environment variables
 
 To show clickable citation links, set your Blob Storage details:
 ```
-BASE_URL=https://<account>.blob.core.windows.net/<container>
-SAS_TOKEN=sp=rl&st=...&se=...&sv=...&sr=c&sig=...
+AZURE_BLOB_BASE_URL=https://<account>.blob.core.windows.net/<container>
+AZURE_BLOB_SAS_TOKEN="sp=rl&st=...&se=...&sv=...&sr=c&sig=..."
 
 AZURE_IMAGE_BASE_URL=https://<account>.blob.core.windows.net/<image-container>
-AZURE_IMAGE_SAS_TOKEN=sp=r&st=...&se=...&spr=https&sv=...&sr=c&sig=...
+AZURE_IMAGE_SAS_TOKEN="sp=r&st=...&se=...&spr=https&sv=...&sr=c&sig=..."
 ```
 
 Documents with no public URL are still cited as plain-text footnotes.
@@ -118,7 +118,7 @@ DEFAULT_ENABLE_ONTOLOGY=true
 ONTOLOGY_DIR=Ontology
 ONTOLOGY_FILE_GLOB=**/*.owl
 ONTOLOGY_ONLY_LOCAL=true
-ONTOLOGY_ENABLE_REASONER=true
+ONTOLOGY_ENABLE_REASONER=false
 ONTOLOGY_REASONER=hermit
 ONTOLOGY_MAX_RESULTS=25
 ONTOLOGY_MAX_DEPTH=5
@@ -126,11 +126,12 @@ ONTOLOGY_MAX_PATHS=10
 ONTOLOGY_MAX_NODES=250
 ONTOLOGY_FUZZY_THRESHOLD=0.62
 ONTOLOGY_AGENT_TIMEOUT_SECONDS=90
+ONTOLOGY_ESCALATION_MIN_CONFIDENCE=0.5
 ```
 
 `DEFAULT_ENABLE_ONTOLOGY` initializes each new React session independently. The active session's switch is sent with each request and does not affect other sessions.
 
-HermiT startup reasoning is enabled by default. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available. Set `ONTOLOGY_ENABLE_REASONER=false` to disable it. When Ontology is enabled, OntologyAgent first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise role-neutral semantic discovery is followed by a skill-free Metadata verifier. DataInsightAgent then loads `sql-planning`, and the primary model selects analytical roles, grain, comparisons, and SQL from the question, OWL evidence, and verified UC metadata. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
+HermiT startup reasoning is disabled by default; enable it only with `ONTOLOGY_ENABLE_REASONER=true` and Java 11+. Explicit classes, properties, restrictions, inverse relations, and multi-hop graph queries remain available without startup reasoning. When Ontology is enabled, OntologyRouter first progressively matches governed Skills. A confirmed governed match skips OWL and Metadata; otherwise code executes the question-driven composite OWL lookup and defined-class lookup directly. Weak results escalate to the full OntologyAgent tool loop. A skill-free Metadata verifier then checks recalled UC candidates before DataInsightAgent loads `sql-planning`. When Ontology is disabled or fails, Metadata discovery progressively loads `metadata-mapping`.
 
 The normal analytics handoff is linear and does not return to the Master LLM between sub-agents. If DataInsightAgent detects an unexpectedly missing or incomplete handoff, its own MAF loop may recover Metadata or enabled Ontology context once before continuing. Disabled Ontology and known upstream Ontology failures are never retried.
 
@@ -144,10 +145,14 @@ DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
 DATABRICKS_CATALOG=<your-unity-catalog-name>
 DATABRICKS_SCHEMAS=silver  # Add comma-separated schemas only when they actually exist
 DATABRICKS_METADATA_CACHE_TTL_SECONDS=900
+METADATA_INDEX_MAX_TABLES=500
+METADATA_CANDIDATE_MAX_TABLES=12
+METADATA_SNAPSHOT_MAX_TABLES=40
 ```
 
-When these are not set, `DatabricksConfig.is_configured()` returns `False` and both agents are skipped.
-Metadata tools cache only objects they actually request: catalog schemas, table summaries for a specific schema, and details for a selected fully-qualified table. The cache is not question-scoped and never preloads every table's columns. Set the TTL to `0` for a process-lifetime object cache.
+When the three connection values are absent, `DatabricksConfig.is_configured()` returns `False`; agents still initialize, but UC and SQL tools report configuration errors when invoked.
+
+Metadata recall lists table summaries up to `METADATA_INDEX_MAX_TABLES`, scores them against question/ontology terms, and batch-fetches at most `METADATA_CANDIDATE_MAX_TABLES` candidate details before the model turn. If recall finds no candidate and the exposed schema has no more than `METADATA_SNAPSHOT_MAX_TABLES`, it falls back to the complete schema; larger schemas use MetadataAgent tools for discovery. Object caches are process-local and keyed by catalog/schema list or fully qualified table. Set the TTL to `0` for a process-lifetime object cache.
 
 ### Step 7: (Optional) Author the Business Layer Document
 
@@ -207,7 +212,7 @@ from src.tools import create_search_tool
 from src.agents import SearchAgent, MasterAgent
 
 search_tool = create_search_tool()
-search_agent = SearchAgent(tools=[search_tool])
+search_agent = SearchAgent(search_tool=search_tool)
 master = MasterAgent(search_agent=search_agent)
 print("All agents initialized")
 ```
@@ -248,7 +253,7 @@ Then run `az login` and ensure your identity has the *Cognitive Services OpenAI 
      "$AZURE_SEARCH_ENDPOINT/indexes/$AZURE_SEARCH_INDEX_NAME?api-version=2023-11-01"
    ```
 
-### "DataInsight/Metadata agent not available"
+### DataInsight/Metadata tools report configuration errors
 
 Set the three required Databricks variables:
 ```
@@ -259,7 +264,7 @@ DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH
 
 1. Confirm FastAPI is running: `curl http://localhost:8000/health`
 2. Check CORS origins in `src/api/main.py` include `http://localhost:3000`
-3. Confirm `VITE_API_URL` in `frontend/.env` (if set) points to `http://localhost:8000`
+3. For a separately hosted backend, set `VITE_API_BASE_URL=http://localhost:8000`; local Vite development normally uses the `/api` proxy
 
 ## 📚 Next Steps
 

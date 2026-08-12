@@ -30,6 +30,7 @@ _TOOL_LABELS = {
     "get_lineage": "Inspect ontology lineage",
     "get_semantic_candidates": "Find semantic properties",
     "get_business_context": "Build ontology business context",
+    "list_defined_classes": "List defined business classes",
     "recover_metadata_context": "Recover missing schema context",
     "recover_ontology_context": "Recover missing ontology context",
 }
@@ -68,6 +69,7 @@ _ONTOLOGY_TOOLS = {
     "get_lineage",
     "get_semantic_candidates",
     "get_business_context",
+    "list_defined_classes",
 }
 
 

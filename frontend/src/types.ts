@@ -19,16 +19,10 @@ export interface SessionInfo {
   message_count: number;
 }
 
-export interface ChatRequest {
-  message: string;
-  thread_id?: string;
-  enable_ontology?: boolean;
-}
-
-export interface ChatResponse {
-  response: string;
-  thread_id: string;
-  timestamp: string;
+export interface ThreadSummary {
+  id: string;
+  message_count: number;
+  last_updated: string;
 }
 
 export interface RuntimeConfig {

@@ -5,7 +5,8 @@ Architecture
 ------------
 * Same MAF pattern as SearchAgent and DataInsightAgent.
 * Uses the Databricks SDK (`databricks-sdk`) for Unity Catalog REST API access.
-* Falls back to `databricks-sql-connector` JDBC queries when the SDK is unavailable.
+* Falls back to `databricks-sql-connector` metadata queries when the SDK is unavailable.
+* Deterministically recalls and batch-fetches candidates before one model verification turn.
 * MAF SkillsProvider advertises and loads agent-scoped skills on demand.
 
 Tools provided to the LLM
@@ -73,8 +74,8 @@ def _compact_hits(terms: set[str], compact: str) -> int:
     )
 
 
-def _jdbc_query_metadata(sql: str) -> List[Dict[str, Any]]:
-    """Execute a metadata SQL query via JDBC and return rows as list-of-dicts."""
+def _sql_connector_query_metadata(sql: str) -> List[Dict[str, Any]]:
+    """Execute a metadata query through the Databricks SQL connector."""
     if not DatabricksConfig.is_configured():
         raise RuntimeError("Databricks connection not configured.")
     try:
@@ -232,11 +233,11 @@ class MetadataAgent:
                 )
             except Exception as exc:
                 logger.warning(
-                    "[Tool:list_schemas] SDK failed, falling back to JDBC: %s",
+                    "[Tool:list_schemas] SDK failed, using SQL connector fallback: %s",
                     exc,
                 )
                 try:
-                    rows = _jdbc_query_metadata(f"SHOW SCHEMAS IN `{catalog}`")
+                    rows = _sql_connector_query_metadata(f"SHOW SCHEMAS IN `{catalog}`")
                     visible_rows = [
                         row
                         for row in rows
@@ -249,7 +250,7 @@ class MetadataAgent:
                         "schemas": visible_rows,
                         "configured_schemas": list(configured_schemas),
                         "count": len(visible_rows),
-                        "source": "jdbc_fallback",
+                        "source": "sql_connector_fallback",
                         "cache_hit": False,
                     }
                 except Exception as fallback_exc:
@@ -330,18 +331,18 @@ class MetadataAgent:
                     total_count += len(table_info)
                 except Exception as exc:
                     logger.warning(
-                        "[Tool:list_tables] SDK failed for %s, JDBC fallback: %s",
+                        "[Tool:list_tables] SDK failed for %s, SQL connector fallback: %s",
                         sch,
                         exc,
                     )
                     try:
-                        rows = _jdbc_query_metadata(
+                        rows = _sql_connector_query_metadata(
                             f"SHOW TABLES IN `{catalog}`.`{sch}`"
                         )
                         all_results["schemas"][sch] = {
                             "tables": rows,
                             "count": len(rows),
-                            "source": "jdbc_fallback",
+                            "source": "sql_connector_fallback",
                             "cache_hit": False,
                         }
                         total_count += len(rows)
@@ -430,18 +431,18 @@ class MetadataAgent:
                     }
             except Exception as exc:
                 logger.warning(
-                    "[Tool:get_table_details] SDK failed, JDBC fallback: %s",
+                    "[Tool:get_table_details] SDK failed, SQL connector fallback: %s",
                     exc,
                 )
                 try:
-                    rows = _jdbc_query_metadata(
+                    rows = _sql_connector_query_metadata(
                         f"DESCRIBE TABLE EXTENDED `{catalog}`.`{schema}`.`{table_name}`"
                     )
                     result = {
                         "status": "ok",
                         "full_name": full_name,
                         "describe": rows,
-                        "source": "jdbc_fallback",
+                        "source": "sql_connector_fallback",
                         "cache_hit": False,
                     }
                 except Exception as fallback_exc:
