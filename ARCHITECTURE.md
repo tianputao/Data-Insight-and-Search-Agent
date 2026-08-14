@@ -114,6 +114,8 @@ The Enterprise Agentic RAG Chatbot uses a **multi-agent orchestration pattern** 
 
 **Lifecycle**: A single `MasterAgent` is created at startup, while each browser thread owns an isolated MAF `AgentSession`. Each user turn creates a request-local `QueryEngineContext`; `ContextVar` propagation keeps tool outcomes, search attempts, original intent, and the SSE sink isolated across concurrent sessions. Agent-scoped native `SkillsProvider` instances advertise and load repository Skills.
 
+**Search loop termination**: After each retrieval, MasterAgent decides whether the accumulated evidence supports the original request and naturally ends the MAF function loop by answering without another tool call. `QUERY_ENGINE_MAX_SEARCH_ATTEMPTS` is only a hard ceiling (default `5`); request-local code also blocks equivalent query sets and stops after a retrieval adds no new document evidence. No separate LLM judge loop is used.
+
 **Session isolation and concurrency**:
 - Frontend messages, loading state, and `AbortController` are keyed by `thread_id`; switching sessions never redirects an in-flight stream into another session.
 - Ontology mode is keyed by `thread_id` in the frontend and captured in each chat request; one session cannot change another session's workflow.

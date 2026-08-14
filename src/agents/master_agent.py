@@ -120,8 +120,14 @@ class MasterAgent:
         )
 
     @staticmethod
-    def _with_runtime_context(message: str, *, enable_ontology: bool) -> str:
+    def _with_runtime_context(
+        message: str,
+        *,
+        enable_ontology: bool,
+        max_search_attempts: Optional[int] = None,
+    ) -> str:
         """Tell the model which request-local pipeline can actually run."""
+        search_attempt_limit = max_search_attempts or AppConfig.QUERY_ENGINE_MAX_SEARCH_ATTEMPTS
         if enable_ontology:
             pipeline_handoff = (
                 "OntologyAgent -> conditional MetadataAgent -> DataInsightAgent"
@@ -132,6 +138,8 @@ class MasterAgent:
             "<session_runtime>\n"
             f"ontology_enabled={str(enable_ontology).lower()}\n"
             f"pipeline_handoff={pipeline_handoff}\n"
+            f"search_attempt_limit={search_attempt_limit}\n"
+            "search_attempt_limit_is_ceiling_not_target=true\n"
             "This request-local mode is authoritative for progress narration and delegation.\n"
             "</session_runtime>\n\n"
             "<original_user_message>\n"
@@ -273,6 +281,95 @@ class MasterAgent:
                 ),
             )
             return activity_id, float(started_at), attempt
+
+        def search_guard(queries: List[str], tool_name: str) -> Optional[str]:
+            """Block only exhausted, no-gain, or equivalent repeated retrieval calls."""
+            turn = self._current_turn()
+            if turn is None:
+                return None
+            turn_state = turn.progress
+            latest = str(turn_state.get("last_search_result") or "")
+            if turn.search_stopped_for_no_gain:
+                self._record_tool_outcome(
+                    "search_stopped_no_gain",
+                    success=False,
+                    retryable=False,
+                    summary="Search stopped after a retrieval added no new evidence",
+                    metadata={"requested_tool": tool_name},
+                )
+                return latest + (
+                    "\n\n<search_control>\n"
+                    "stop_reason=no_new_evidence\n"
+                    "instruction=Do not search again. Answer from accumulated evidence and "
+                    "state any unresolved limitation.\n"
+                    "</search_control>"
+                )
+            if not turn.register_search_request(queries):
+                self._record_tool_outcome(
+                    "search_duplicate_blocked",
+                    success=False,
+                    retryable=False,
+                    summary="Equivalent search query already executed",
+                    metadata={"requested_tool": tool_name},
+                )
+                return latest + (
+                    "\n\n<search_control>\n"
+                    "stop_reason=equivalent_query_already_executed\n"
+                    "instruction=Do not repeat this query. Answer now if evidence is sufficient; "
+                    "otherwise search only for a different concrete gap.\n"
+                    "</search_control>"
+                )
+            return None
+
+        def search_evidence_status(
+            results: List[Dict[str, Any]],
+            *,
+            attempt: int,
+            search_limit: int,
+        ) -> tuple[Dict[str, Any], str]:
+            """Expose evidence gain and remaining ceiling without deciding sufficiency."""
+            turn = self._current_turn()
+            gain: Dict[str, Any] = {
+                "selected_count": len(results),
+                "new_unique_count": len(results),
+                "overlap_count": 0,
+                "total_unique_count": len(results),
+                "no_new_evidence": False,
+            }
+            if turn is not None:
+                gain = dict(turn.register_search_results(results))
+            remaining = max(0, search_limit - attempt)
+            gain["attempt"] = attempt
+            gain["attempt_limit"] = search_limit
+            gain["remaining_attempts"] = remaining
+            if gain["no_new_evidence"]:
+                instruction = (
+                    "This retrieval added no new evidence. Stop searching and answer from the "
+                    "accumulated evidence, explicitly noting any unresolved limitation."
+                )
+            elif remaining == 0:
+                instruction = (
+                    "The search ceiling is exhausted. Answer from the accumulated evidence and "
+                    "explicitly note any unresolved limitation."
+                )
+            else:
+                instruction = (
+                    "Assess the accumulated evidence against the original user request. If every "
+                    "material claim is directly supported, stop searching and answer now. Search "
+                    "again only for a different concrete unresolved gap from the original request."
+                )
+            control = (
+                "\n\n<search_control>\n"
+                f"attempt={attempt}\n"
+                f"attempt_limit={search_limit}\n"
+                f"remaining_attempts={remaining}\n"
+                f"new_unique_evidence={gain['new_unique_count']}\n"
+                f"overlapping_evidence={gain['overlap_count']}\n"
+                f"total_unique_evidence={gain['total_unique_count']}\n"
+                f"instruction={instruction}\n"
+                "</search_control>"
+            )
+            return gain, control
 
         def finish_agent_activity(
             activity_id: str,
@@ -599,11 +696,12 @@ Original Question: {original_query}
 
 Requirements:
 1. Each sub-question should be specific and independently searchable
-2. Correct ambiguous wording, spelling, abbreviations, and likely terminology errors
-3. Enrich each query with relevant synonyms, formal names, and domain terminology
-4. Sub-questions should cover different aspects without unnecessary overlap
-5. Preserve every constraint and comparison requested by the user
-6. Return ONLY the final search-ready sub-questions, numbered 1-{num_subqueries}
+2. Repair only defective wording: misspellings, ambiguous abbreviations, and garbled or unclear phrasing
+3. Never add a qualifier the user did not state, including recency wording such as "latest", "current", or "in force", edition or version numbers, dates, regions, or extra requirements
+4. Use a formal name or synonym only to replace defective wording, never to narrow the question
+5. Sub-questions should cover different aspects without unnecessary overlap
+6. Preserve every constraint and comparison actually requested by the user
+7. Return ONLY the final search-ready sub-questions, numbered 1-{num_subqueries}
 
 Sub-questions:"""
             
@@ -660,17 +758,20 @@ Sub-questions:"""
             )
             if int(turn_state.get("search_attempts", 0)) >= search_limit:
                 self._record_tool_outcome(
-                    "search_multiple_queries",
+                    "search_budget_blocked",
                     success=False,
                     retryable=False,
                     summary="Search attempt limit reached",
-                    metadata={"query_count": len(queries)},
+                    metadata={"query_count": len(queries), "attempt_limit": search_limit},
                     started_at=tool_started_at,
                 )
                 return (
-                    "SearchAgent has reached the configured retrieval-attempt limit. "
+                    f"SearchAgent has reached the configured ceiling of {search_limit} retrieval attempts. "
                     "Use the available evidence and clearly acknowledge any remaining gap."
                 )
+            guarded = search_guard(queries, "search_multiple_queries")
+            if guarded is not None:
+                return guarded
             agent_activity_id, agent_started_at, search_attempt = start_search_activity(
                 "\n".join(queries[:5])
             )
@@ -685,13 +786,21 @@ Sub-questions:"""
                 metrics = progress.get("metrics") if isinstance(progress.get("metrics"), dict) else {}
                 if progress.get("query_index"):
                     metrics = {**metrics, "query_index": progress["query_index"]}
+                metrics = {
+                    **metrics,
+                    "attempt": search_attempt,
+                    "attempt_limit": search_limit,
+                }
                 push_stream_event(
                     "activity",
                     stage_activity(
                         f"{agent_activity_id}-attempt-{search_attempt}-{stage}",
                         agent_activity_id,
                         "SearchAgent",
-                        str(progress.get("message") or stage.replace("_", " ").title()),
+                        (
+                            f"Attempt {search_attempt}: "
+                            + str(progress.get("message") or stage.replace("_", " ").title())
+                        ),
                         state=str(progress.get("state") or "running"),
                         detail=progress.get("detail"),
                         category=str(progress.get("category") or "search"),
@@ -839,10 +948,14 @@ Sub-questions:"""
             logger.info(f"[Tool] Aggregated {len(aggregated_results)} unique results from {len(queries)} queries")
             
             # Format aggregated results
+            returned_results = aggregated_results[:20]
             formatted_results = []
-            formatted_results.append(f"Found {len(aggregated_results)} unique documents across {len(queries)} search queries:\\n")
+            formatted_results.append(
+                f"Found {len(returned_results)} relevant documents across "
+                f"{len(queries)} search queries:\\n"
+            )
             
-            for i, result in enumerate(aggregated_results[:20], 1):  # Limit to top 20
+            for i, result in enumerate(returned_results, 1):
                 content = result.get("content", "No content available")
                 title = result.get("title", "Untitled")
                 url = result.get("url") or "Internal Document"
@@ -857,26 +970,37 @@ Sub-questions:"""
                 formatted_results.append(f"Content: {content}")
                 formatted_results.append(f"Source: {url}\\n")
             
-            result_text = "\\n".join(formatted_results)
+            gain, search_control = search_evidence_status(
+                returned_results,
+                attempt=search_attempt,
+                search_limit=search_limit,
+            )
+            result_text = "\\n".join(formatted_results) + search_control
+            turn_state["last_search_result"] = result_text
             finish_agent_activity(
                 agent_activity_id,
                 "SearchAgent",
                 "\n".join(queries[:5]),
                 agent_started_at,
-                summary=f"Selected {len(aggregated_results)} unique documents",
+                summary=f"Selected {len(returned_results)} relevant documents",
                 metrics={
                     "query_count": len(queries),
-                    "selected_count": len(aggregated_results),
+                    "selected_count": len(returned_results),
                     "attempts": search_attempt,
+                    "attempt_limit": search_limit,
+                    "remaining_attempts": gain["remaining_attempts"],
+                    "new_unique_count": gain["new_unique_count"],
+                    "overlap_count": gain["overlap_count"],
                 },
             )
             self._record_tool_outcome(
                 "search_multiple_queries",
                 success=True,
-                summary=f"Selected {len(aggregated_results)} unique documents",
+                summary=f"Selected {len(returned_results)} relevant documents",
                 metadata={
                     "query_count": len(queries),
-                    "selected_count": len(aggregated_results),
+                    "selected_count": len(returned_results),
+                    **gain,
                 },
                 started_at=tool_started_at,
             )
@@ -906,16 +1030,21 @@ Sub-questions:"""
             if int(turn_state.get("search_attempts", 0)) >= search_limit:
                 logger.warning("SearchAgent attempt limit reached; reusing the latest search result.")
                 self._record_tool_outcome(
-                    "search_knowledge",
+                    "search_budget_blocked",
                     success=False,
                     retryable=False,
                     summary="Search attempt limit reached",
+                    metadata={"attempt_limit": search_limit},
                     started_at=tool_started_at,
                 )
                 return turn_state.get("last_search_result") or (
-                    "SearchAgent has already completed two retrieval attempts for this turn. "
+                    f"SearchAgent has reached the configured ceiling of {search_limit} retrieval "
+                    "attempts for this turn. "
                     "Use the available evidence and acknowledge any remaining gap."
                 )
+            guarded = search_guard([query], "search_knowledge")
+            if guarded is not None:
+                return guarded
             agent_activity_id, agent_started_at, search_attempt = start_search_activity(query)
 
             import asyncio
@@ -934,17 +1063,31 @@ Sub-questions:"""
 
             def report_search_progress(progress: Dict[str, Any]) -> None:
                 stage = str(progress.get("stage") or "search")
+                metrics = (
+                    dict(progress.get("metrics"))
+                    if isinstance(progress.get("metrics"), dict)
+                    else {}
+                )
+                metrics.update(
+                    {
+                        "attempt": search_attempt,
+                        "attempt_limit": search_limit,
+                    }
+                )
                 push_stream_event(
                     "activity",
                     stage_activity(
                         f"{agent_activity_id}-attempt-{search_attempt}-{stage}",
                         agent_activity_id,
                         "SearchAgent",
-                        str(progress.get("message") or stage.replace("_", " ").title()),
+                        (
+                            f"Attempt {search_attempt}: "
+                            + str(progress.get("message") or stage.replace("_", " ").title())
+                        ),
                         state=str(progress.get("state") or "running"),
                         detail=progress.get("detail"),
                         category=str(progress.get("category") or "search"),
-                        metrics=progress.get("metrics") if isinstance(progress.get("metrics"), dict) else {},
+                        metrics=metrics,
                     ),
                 )
 
@@ -1075,7 +1218,12 @@ Sub-questions:"""
                 ):
                     refs_map[citation_id] = (str(title).strip() or f"Reference {citation_id}", str(url).strip())
 
-            result_text = "\n".join(formatted_parts)
+            gain, search_control = search_evidence_status(
+                results,
+                attempt=search_attempt,
+                search_limit=search_limit,
+            )
+            result_text = "\n".join(formatted_parts) + search_control
             turn_state["last_search_result"] = result_text
             _push_refs(refs_map)
             finish_agent_activity(
@@ -1087,6 +1235,10 @@ Sub-questions:"""
                 metrics={
                     "selected_count": len(results),
                     "attempts": search_attempt,
+                    "attempt_limit": search_limit,
+                    "remaining_attempts": gain["remaining_attempts"],
+                    "new_unique_count": gain["new_unique_count"],
+                    "overlap_count": gain["overlap_count"],
                     "semantic_ranking": self.search_agent.search_tool.enable_semantic_reranker,
                     "agentic_retrieval": self.search_agent.search_tool.enable_agentic_retrieval,
                 },
@@ -1095,7 +1247,11 @@ Sub-questions:"""
                 "search_knowledge",
                 success=True,
                 summary=f"Selected {len(results)} relevant documents",
-                metadata={"query": query, "selected_count": len(results)},
+                metadata={
+                    "query": query,
+                    "selected_count": len(results),
+                    **gain,
+                },
                 started_at=tool_started_at,
             )
             logger.info(f"[Tool] search_knowledge completed: {len(results)} results, {len(result_text)} chars")
@@ -2066,6 +2222,7 @@ Remember: When agentic retrieval is {agentic_status}, follow the corresponding w
             contextual_message = self._with_runtime_context(
                 message,
                 enable_ontology=turn.enable_ontology,
+                max_search_attempts=turn.max_search_attempts,
             )
             response_stream = stream_agent(
                 self.agent,

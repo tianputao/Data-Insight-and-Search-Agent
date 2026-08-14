@@ -290,27 +290,12 @@ npm --prefix frontend audit
 
 `test_search.py` requires live Azure AI Search and is excluded from the deterministic PR suite.
 
-## 🔒 Security
-
-- Local credentials belong in git-ignored `.env`; production credentials belong in platform-managed settings/secrets and must never be committed
-- `AZURE_OPENAI_AUTH_MODE=aad` forces `DefaultAzureCredential`; no API key needed at runtime
-- Databricks PAT token stored in `.env`; Unity Catalog RBAC controls data access
 
 ## 📝 Logging
 
 Logs in `logs/application_YYYYMMDD.log`:
 - Agent decisions, tool calls, search queries, SQL executions, citation collection, errors
 
-## 🔧 Troubleshooting
-
-**403 AuthenticationTypeDisabled** — Key-based auth is disabled on your Azure OpenAI resource.
-Set `AZURE_OPENAI_AUTH_MODE=aad` and ensure `az login` identity has the *Cognitive Services OpenAI User* role.
-
-**Search returns no results** — Verify index name in `.env`, check `AZURE_SEARCH_VECTOR_FIELD=contentVector` matches your schema, confirm embedding dimensions = 3072.
-
-**DataInsight/Metadata tools report configuration errors** — `DatabricksConfig.is_configured()` returns `False`; set `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and `DATABRICKS_HTTP_PATH` in `.env`.
-
-**Frontend cannot reach backend** — Confirm FastAPI is running on port 8000 and check CORS origins in `src/api/main.py`.
 
 ## 📄 License
 

@@ -266,7 +266,7 @@ class AppConfig:
     # Search configuration
     MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '20'))
     # MasterAgent query engine limits. MAF applies these to one function-invocation loop.
-    QUERY_ENGINE_MAX_SEARCH_ATTEMPTS = max(1, int(os.getenv('QUERY_ENGINE_MAX_SEARCH_ATTEMPTS', '2')))
+    QUERY_ENGINE_MAX_SEARCH_ATTEMPTS = max(1, int(os.getenv('QUERY_ENGINE_MAX_SEARCH_ATTEMPTS', '5')))
     QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS = max(1, int(os.getenv('QUERY_ENGINE_MAX_CONSECUTIVE_ERRORS', '3')))
     QUERY_ENGINE_MAX_MODEL_ROUNDTRIPS = max(
         1,

@@ -228,6 +228,8 @@ class SearchAgent:
                 )
             
             processed_results.append({
+                "id": result.get("id"),
+                "filepath": result.get("filepath"),
                 "citation_id": str(i),
                 "content": content,  # Use cleaned/enhanced content
                 "title": result.get("title"),

@@ -283,6 +283,7 @@ def test_master_runtime_context_matches_session_ontology_mode() -> None:
     disabled = MasterAgent._with_runtime_context(
         "monthly sales",
         enable_ontology=False,
+        max_search_attempts=5,
     )
     enabled = MasterAgent._with_runtime_context(
         "monthly sales",
@@ -292,10 +293,29 @@ def test_master_runtime_context_matches_session_ontology_mode() -> None:
     assert "ontology_enabled=false" in disabled
     assert "pipeline_handoff=MetadataAgent -> DataInsightAgent" in disabled
     assert "OntologyAgent" not in disabled
+    assert "search_attempt_limit=5" in disabled
+    assert "search_attempt_limit_is_ceiling_not_target=true" in disabled
     assert "ontology_enabled=true" in enabled
     assert "OntologyAgent -> conditional MetadataAgent -> DataInsightAgent" in enabled
     assert "ontology_enabled=false" in MASTER_AGENT_PROMPT
     assert "MUST NOT mention OntologyAgent" in MASTER_AGENT_PROMPT
+    assert "hard ceiling, never as a target" in MASTER_AGENT_PROMPT
+    assert "stop calling search tools and answer now" in MASTER_AGENT_PROMPT
+    assert "completed two retrieval attempts" not in MASTER_AGENT_PROMPT
+
+
+def test_master_prompt_repairs_queries_without_inventing_constraints() -> None:
+    assert "Never add a qualifier the user did not state" in MASTER_AGENT_PROMPT
+    assert "are constraints, not enrichment" in MASTER_AGENT_PROMPT
+    assert "repaired only where the original wording is defective" in MASTER_AGENT_PROMPT
+    assert "corrected and enriched query" not in MASTER_AGENT_PROMPT
+    assert "correcting and enriching terminology" not in MASTER_AGENT_PROMPT
+    # A self-introduced version qualifier must not suppress an otherwise supported answer.
+    assert "never withhold or downgrade the answer" in MASTER_AGENT_PROMPT
+    # The data path keeps the same protection without changing its own agents.
+    assert "do not add filters, time windows, or qualifiers the user did not state" in (
+        MASTER_AGENT_PROMPT
+    )
 
 
 def test_ontology_agent_uses_primary_deployment(monkeypatch) -> None:
