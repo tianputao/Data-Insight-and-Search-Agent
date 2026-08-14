@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ChatRequest, ChatResponse, SkillInfo, SessionInfo } from '../types';
+import type { RuntimeConfig, SkillInfo, ThreadSummary } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -11,12 +11,6 @@ const apiClient = axios.create({
 });
 
 export const apiService = {
-  // Chat endpoints
-  async sendMessage(request: ChatRequest): Promise<ChatResponse> {
-    const response = await apiClient.post<ChatResponse>('/chat', request);
-    return response.data;
-  },
-
   // Skills endpoints
   async listSkills(): Promise<SkillInfo[]> {
     const response = await apiClient.get<SkillInfo[]>('/skills');
@@ -24,8 +18,8 @@ export const apiService = {
   },
 
   // Thread endpoints
-  async listThreads(): Promise<SessionInfo[]> {
-    const response = await apiClient.get<SessionInfo[]>('/threads');
+  async listThreads(): Promise<ThreadSummary[]> {
+    const response = await apiClient.get<ThreadSummary[]>('/threads');
     return response.data;
   },
 
@@ -43,9 +37,30 @@ export const apiService = {
     await apiClient.delete(`/threads/${threadId}`);
   },
 
+  async stopThread(threadId: string): Promise<{ thread_id: string; stopped: boolean }> {
+    const response = await apiClient.post(`/threads/${threadId}/stop`);
+    return response.data;
+  },
+
+  // Workspace business semantic layer (shared by every session)
+  async getBusinessLayer(): Promise<{ content: string }> {
+    const response = await apiClient.get<{ content: string }>('/business-layer');
+    return response.data;
+  },
+
+  async saveBusinessLayer(content: string): Promise<{ ok: boolean; length: number }> {
+    const response = await apiClient.put<{ ok: boolean; length: number }>('/business-layer', { content });
+    return response.data;
+  },
+
   // Health check
   async healthCheck(): Promise<{ status: string; agent_initialized: boolean }> {
     const response = await apiClient.get('/health');
+    return response.data;
+  },
+
+  async getRuntimeConfig(): Promise<RuntimeConfig> {
+    const response = await apiClient.get<RuntimeConfig>('/config');
     return response.data;
   },
 };

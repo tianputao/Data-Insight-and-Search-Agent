@@ -5,28 +5,31 @@ import './styles/global.css';
 import './styles/App.css';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { ActivityPanel } from './components/ActivityPanel';
+import type { ActivityItem, ActivityKind, ActivityState } from './types/activity';
 
-// Example questions from the enterprise knowledge base (matching app.py EXAMPLE_QUESTIONS)
+// Example questions spanning the enterprise knowledge base and Databricks analytics
 const EXAMPLE_QUERIES = [
   "汽车用液化天然气的加液口基本构型",
   "电动汽车用动力蓄电池安全要求",
   "What are the recall criteria for defective automotive products",
   "什么是management body, 它在乘用车法规里做什么用的，目前发行了几个版本",
   "哪个客户在2023年的消费是最高的",
-  "按月看2022年的销售额趋势",
-  "按产品类别看2023的销量"
+  "按月看2023年的销售额趋势",
+  "哪个地区的成交量是最高的，在这个地区那个产品销量最高，并且结合数据分析原因",
+  "按企业定义分析 2023 年高价值订单的月度趋势、订单占比和销售额贡献率。",
+  "按地区同时比较订单数、销量、销售额和平均客单价，并解释最高地区领先第二名的主要结构因素。",
+  "2023年高价值订单主要来自哪类客户、发往哪些地区、集中在哪些顶层产品大类？",
+  "按顶层产品大类比较折扣明细行的成交额占比、折扣明细的成交量贡献，以及每单成交额；并说明折扣是否集中在少数大类。",
+  "2023年各顶层产品大类的销量和订单明细分别是多少？并找出每个顶层大类贡献最高的子类目及其贡献率。"
 ];
 
-interface ThinkingMessage {
-  type: 'thinking';
-  content: string;
-  timestamp: string;
-}
-
 interface MessageWithThinking extends ChatMessage {
-  thinking?: ThinkingMessage[];
+  thinking?: ActivityItem[];
   thinkingCollapsed?: boolean;
 }
+
+const EMPTY_MESSAGES: MessageWithThinking[] = [];
 
 const normalizeReferenceUrl = (rawUrl: string): string => {
   if (!rawUrl) return '';
@@ -84,6 +87,75 @@ const referenceGroupKeys = (url: string): string[] => {
   }
 };
 
+const tableRowCells = (row: string): string[] | null => {
+  const stripped = row.trim();
+  if (stripped.length < 2 || !stripped.startsWith('|') || !stripped.endsWith('|')) {
+    return null;
+  }
+  return stripped.slice(1, -1).split('|');
+};
+
+const isTableSeparatorRow = (cells: string[]): boolean =>
+  cells.length > 0 && cells.every(cell => /^\s*:?-{3,}:?\s*$/.test(cell));
+
+const splitCollapsedTableRow = (
+  line: string,
+  expectedCells: number | null
+): string[] | null => {
+  const candidates = line.replace(/\|\s*\|/g, '|\n|').split('\n');
+  if (candidates.length < 2) return null;
+
+  const parsed = candidates.map(tableRowCells);
+  if (parsed.some(cells => cells === null)) return null;
+
+  const widths = new Set(parsed.map(cells => (cells as string[]).length));
+  if (widths.size !== 1) return null;
+
+  const width = widths.values().next().value as number;
+  if (expectedCells !== null) {
+    // A row with genuinely empty cells splits into the wrong width, so it stays intact.
+    return width === expectedCells ? candidates : null;
+  }
+  return parsed.some(cells => isTableSeparatorRow(cells as string[])) ? candidates : null;
+};
+
+export const repairCollapsedMarkdownTables = (content: string): string => {
+  if (!content || !content.includes('|')) return content;
+
+  const repairedLines: string[] = [];
+  let inCodeFence = false;
+  let expectedCells: number | null = null;
+
+  for (const line of content.split('\n')) {
+    if (line.trimStart().startsWith('```')) {
+      inCodeFence = !inCodeFence;
+      expectedCells = null;
+      repairedLines.push(line);
+      continue;
+    }
+
+    const cells = inCodeFence ? null : tableRowCells(line);
+    if (cells === null) {
+      expectedCells = null;
+      repairedLines.push(line);
+      continue;
+    }
+
+    const rows = splitCollapsedTableRow(line, expectedCells);
+    if (rows === null) {
+      repairedLines.push(line);
+      if (isTableSeparatorRow(cells)) expectedCells = cells.length;
+      continue;
+    }
+
+    repairedLines.push(...rows);
+    const firstRow = tableRowCells(rows[0]);
+    expectedCells = firstRow ? firstRow.length : null;
+  }
+
+  return repairedLines.join('\n');
+};
+
 const normalizeCitationsForDisplay = (content: string): string => {
   if (!content) return content;
 
@@ -112,7 +184,7 @@ const normalizeCitationsForDisplay = (content: string): string => {
     }
   }
 
-  for (const m of refsText.matchAll(/\[(\d+)\]\s+([^\n\[][^\n]*)/g)) {
+  for (const m of refsText.matchAll(/\[(\d+)\]\s+((?!\[)[^\n]+)/g)) {
     const num = m[1];
     if (!refsMap.has(num)) {
       refsMap.set(num, { title: (m[2] || '').trim() || `Reference ${num}`, url: '' });
@@ -237,29 +309,88 @@ const ProxiedImage: React.FC<{ src?: string; alt?: string }> = ({ src, alt }) =>
 
 function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [messages, setMessages] = useState<MessageWithThinking[]>([]);
-  const [currentThinking, setCurrentThinking] = useState<ThinkingMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [sessionCounter, setSessionCounter] = useState(1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [sessionMessages, setSessionMessages] = useState<Map<string, MessageWithThinking[]>>(new Map());
+  const [defaultEnableOntology, setDefaultEnableOntology] = useState(true);
+  const [sessionOntologyModes, setSessionOntologyModes] = useState<Map<string, boolean>>(new Map());
+  const [loadingSessionIds, setLoadingSessionIds] = useState<Set<string>>(new Set());
+  const [businessLayerOpen, setBusinessLayerOpen] = useState(false);
+  const [businessLayerDraft, setBusinessLayerDraft] = useState('');
+  const [businessLayerStatus, setBusinessLayerStatus] = useState('');
+  const [businessLayerBusy, setBusinessLayerBusy] = useState(false);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+  const programmaticScrollRef = useRef(false);
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const initialSessionRequestedRef = useRef(false);
+
+  const messages = sessionMessages.get(currentSessionId) ?? EMPTY_MESSAGES;
+  const isLoading = loadingSessionIds.has(currentSessionId);
+  const ontologyEnabled = sessionOntologyModes.get(currentSessionId) ?? defaultEnableOntology;
+
+  const updateSessionMessages = (
+    sessionId: string,
+    updater: (previous: MessageWithThinking[]) => MessageWithThinking[]
+  ) => {
+    setSessionMessages(previous => {
+      const next = new Map(previous);
+      next.set(sessionId, updater(next.get(sessionId) ?? []));
+      return next;
+    });
+  };
+
+  const openBusinessLayer = async () => {
+    setBusinessLayerOpen(true);
+    setBusinessLayerBusy(true);
+    setBusinessLayerStatus('Loading…');
+    try {
+      const { content } = await apiService.getBusinessLayer();
+      setBusinessLayerDraft(content);
+      setBusinessLayerStatus('');
+    } catch {
+      setBusinessLayerStatus('Could not load the document.');
+    } finally {
+      setBusinessLayerBusy(false);
+    }
+  };
+
+  const persistBusinessLayer = async () => {
+    setBusinessLayerBusy(true);
+    setBusinessLayerStatus('Saving…');
+    try {
+      const { length } = await apiService.saveBusinessLayer(businessLayerDraft);
+      setBusinessLayerStatus(`Saved (${length} characters). It applies from your next question.`);
+    } catch {
+      setBusinessLayerStatus('Save failed.');
+    } finally {
+      setBusinessLayerBusy(false);
+    }
+  };
 
   useEffect(() => {
     // Create the initial session on mount
-    if (sessions.length === 0) {
-      createInitialSession();
+    if (sessions.length === 0 && !initialSessionRequestedRef.current) {
+      initialSessionRequestedRef.current = true;
+      initializeApplication();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- initialization is mount-only
   }, []);
 
   useEffect(() => {
-    if (chatContainerRef.current && autoScroll) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-    }
-  }, [messages, currentThinking, autoScroll]);
+    autoScrollRef.current = autoScroll;
+  }, [autoScroll]);
+
+  // Reads the ref, not the state, so a streaming update never re-applies a stale intent.
+  useEffect(() => {
+    const container = chatContainerRef.current;
+    if (!container || !autoScrollRef.current) return;
+    programmaticScrollRef.current = true;
+    container.scrollTop = container.scrollHeight;
+  }, [messages]);
 
   // 监听用户滚动
   useEffect(() => {
@@ -267,24 +398,45 @@ function App() {
     if (!container) return;
 
     const handleScroll = () => {
+      if (programmaticScrollRef.current) {
+        programmaticScrollRef.current = false;
+        return;
+      }
       const { scrollTop, scrollHeight, clientHeight } = container;
       const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
+      autoScrollRef.current = isNearBottom;
       setAutoScroll(isNearBottom);
     };
 
+    // Scrolling up is unambiguous intent to read, so release the stream immediately.
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0 && autoScrollRef.current) {
+        autoScrollRef.current = false;
+        setAutoScroll(false);
+      }
+    };
+
     container.addEventListener('scroll', handleScroll);
-    return () => container.removeEventListener('scroll', handleScroll);
+    container.addEventListener('wheel', handleWheel, { passive: true });
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleWheel);
+    };
   }, []);
 
-  const toggleThinking = (messageIndex: number) => {
-    setMessages(prev => prev.map((msg, idx) => 
-      idx === messageIndex 
-        ? { ...msg, thinkingCollapsed: !msg.thinkingCollapsed }
-        : msg
-    ));
+  const initializeApplication = async () => {
+    let ontologyDefault = true;
+    try {
+      const runtimeConfig = await apiService.getRuntimeConfig();
+      ontologyDefault = runtimeConfig.default_enable_ontology;
+      setDefaultEnableOntology(ontologyDefault);
+    } catch (error) {
+      console.error('Failed to load runtime config; using ontology default:', error);
+    }
+    await createInitialSession(ontologyDefault);
   };
 
-  const createInitialSession = async () => {
+  const createInitialSession = async (ontologyDefault: boolean) => {
     try {
       const result = await apiService.createThread();
       const newSession: SessionInfo = {
@@ -296,20 +448,16 @@ function App() {
       setCurrentSessionId(result.thread_id);
       setSessions([newSession]);
       setSessionCounter(2);
-      setMessages([]);
-      setCurrentThinking([]);
+      setSessionMessages(new Map([[result.thread_id, []]]));
+      setSessionOntologyModes(new Map([[result.thread_id, ontologyDefault]]));
     } catch (error) {
+      initialSessionRequestedRef.current = false;
       console.error('Failed to create initial session:', error);
     }
   };
 
   const createNewSession = async () => {
     try {
-      // 保存当前session的消息
-      if (currentSessionId && messages.length > 0) {
-        setSessionMessages(prev => new Map(prev).set(currentSessionId, messages));
-      }
-
       const result = await apiService.createThread();
       const newSession: SessionInfo = {
         id: result.thread_id,
@@ -320,24 +468,16 @@ function App() {
       setCurrentSessionId(result.thread_id);
       setSessions(prev => [...prev, newSession]);
       setSessionCounter(prev => prev + 1);
-      setMessages([]);
-      setCurrentThinking([]);
+      setSessionMessages(prev => new Map(prev).set(result.thread_id, []));
+      setSessionOntologyModes(prev => new Map(prev).set(result.thread_id, defaultEnableOntology));
     } catch (error) {
       console.error('Failed to create session:', error);
     }
   };
 
   const switchSession = (sessionId: string) => {
-    // 保存当前session的消息
-    if (currentSessionId && messages.length > 0) {
-      setSessionMessages(prev => new Map(prev).set(currentSessionId, messages));
-    }
-
-    // 加载目标session的消息
-    const savedMessages = sessionMessages.get(sessionId) || [];
     setCurrentSessionId(sessionId);
-    setMessages(savedMessages);
-    setCurrentThinking([]);
+    setAutoScroll(true);
   };
 
   const deleteSession = async (sessionId: string, e: React.MouseEvent) => {
@@ -350,20 +490,35 @@ function App() {
     }
 
     try {
+      abortControllersRef.current.get(sessionId)?.abort();
+      abortControllersRef.current.delete(sessionId);
+      await apiService.stopThread(sessionId).catch(() => undefined);
+      await apiService.deleteThread(sessionId);
+
       // 删除session的消息记录
       setSessionMessages(prev => {
         const newMap = new Map(prev);
         newMap.delete(sessionId);
         return newMap;
       });
+      setSessionOntologyModes(prev => {
+        const next = new Map(prev);
+        next.delete(sessionId);
+        return next;
+      });
 
       setSessions(prev => prev.filter(s => s.id !== sessionId));
+      setLoadingSessionIds(previous => {
+        const next = new Set(previous);
+        next.delete(sessionId);
+        return next;
+      });
       
       // 如果删除的是当前session，切换到第一个session
       if (currentSessionId === sessionId) {
         const remainingSessions = sessions.filter(s => s.id !== sessionId);
         if (remainingSessions.length > 0) {
-          switchSession(remainingSessions[0].id);
+          setCurrentSessionId(remainingSessions[0].id);
         }
       }
     } catch (error) {
@@ -374,17 +529,19 @@ function App() {
   const sendMessageStream = async () => {
     if (!inputValue.trim() || isLoading) return;
 
+    const sessionId = currentSessionId;
+    if (!sessionId) return;
+    const requestOntologyMode = sessionOntologyModes.get(sessionId) ?? defaultEnableOntology;
+
     const userMessage: MessageWithThinking = {
       role: 'user',
       content: inputValue,
       timestamp: new Date().toISOString()
     };
 
-    setMessages(prev => [...prev, userMessage]);
     const currentInput = inputValue;
     setInputValue('');
-    setIsLoading(true);
-    setCurrentThinking([]);
+    setLoadingSessionIds(previous => new Set(previous).add(sessionId));
     setAutoScroll(true); // 开始新消息时启用自动滚动
 
     // 先创建一个空的assistant消息框架，thinking在前面
@@ -395,7 +552,14 @@ function App() {
       thinking: [],
       thinkingCollapsed: false
     };
-    setMessages(prev => [...prev, initialAssistantMessage]);
+    updateSessionMessages(sessionId, previous => [
+      ...previous,
+      userMessage,
+      initialAssistantMessage,
+    ]);
+
+    const abortController = new AbortController();
+    abortControllersRef.current.set(sessionId, abortController);
 
     try {
       const response = await fetch(apiUrl('/chat/stream'), {
@@ -405,8 +569,10 @@ function App() {
         },
         body: JSON.stringify({
           message: currentInput,
-          thread_id: currentSessionId
-        })
+          thread_id: sessionId,
+          enable_ontology: requestOntologyMode
+        }),
+        signal: abortController.signal,
       });
 
       if (!response.ok) {
@@ -417,50 +583,116 @@ function App() {
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let assistantContent = '';
-      let thinkingForMessage: ThinkingMessage[] = [];
+      let thinkingForMessage: ActivityItem[] = [];
       let sseBuffer = '';
-      let pendingThinkingQueue: ThinkingMessage[] = [];
-      let thinkingFlushTask: Promise<void> | null = null;
+      let activitySequence = 0;
+      let didFinalize = false;
 
-      const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-      const updateAssistantMessage = (content: string, thinking: ThinkingMessage[]) => {
-        setMessages(prev => {
+      const updateAssistantMessage = (content: string, thinking: ActivityItem[]) => {
+        updateSessionMessages(sessionId, prev => {
           const newMessages = [...prev];
           const lastMessage = newMessages[newMessages.length - 1];
           if (lastMessage && lastMessage.role === 'assistant') {
-            lastMessage.content = content;
-            lastMessage.thinking = [...thinking];
+            newMessages[newMessages.length - 1] = {
+              ...lastMessage,
+              content,
+              thinking: [...thinking]
+            };
           }
           return newMessages;
         });
       };
 
-      const enqueueThinking = (message: string) => {
-        const currentLast = pendingThinkingQueue[pendingThinkingQueue.length - 1]?.content
-          || thinkingForMessage[thinkingForMessage.length - 1]?.content;
-        if (currentLast === message) {
-          return;
+      const upsertThinking = (data: Record<string, unknown>) => {
+        const content = typeof data.message === 'string' ? data.message.trim() : '';
+        if (!content) return;
+
+        const id = typeof data.id === 'string' && data.id
+          ? data.id
+          : `activity-${++activitySequence}`;
+        const supportedKinds: ActivityKind[] = ['narration', 'agent', 'stage', 'tool', 'skill', 'reasoning', 'status'];
+        const kind: ActivityKind = typeof data.kind === 'string' && supportedKinds.includes(data.kind as ActivityKind)
+          ? data.kind as ActivityKind
+          : 'tool';
+        const state: ActivityState = data.state === 'completed' || data.state === 'error'
+          ? data.state
+          : 'running';
+        const existingIndex = thinkingForMessage.findIndex(item => item.id === id);
+
+        if (existingIndex >= 0) {
+          const existing = thinkingForMessage[existingIndex];
+          const nextContent = data.append === true ? existing.content + content : content;
+          thinkingForMessage = thinkingForMessage.map((item, index) => index === existingIndex
+            ? {
+                ...item,
+                content: nextContent,
+                state,
+                category: typeof data.category === 'string' ? data.category : item.category,
+                agent: typeof data.agent === 'string' ? data.agent : item.agent,
+                parentId: typeof data.parent_id === 'string' ? data.parent_id : item.parentId,
+                detail: typeof data.detail === 'string' ? data.detail : item.detail,
+                summary: typeof data.summary === 'string' ? data.summary : item.summary,
+                durationMs: typeof data.duration_ms === 'number' ? data.duration_ms : item.durationMs,
+                metrics: typeof data.metrics === 'object' && data.metrics !== null
+                  ? data.metrics as Record<string, unknown>
+                  : item.metrics
+              }
+            : item);
+        } else {
+          thinkingForMessage = [...thinkingForMessage, {
+            id,
+            kind,
+            category: typeof data.category === 'string' ? data.category : kind,
+            state,
+            agent: typeof data.agent === 'string' ? data.agent : undefined,
+            parentId: typeof data.parent_id === 'string' ? data.parent_id : undefined,
+            content,
+            detail: typeof data.detail === 'string' ? data.detail : undefined,
+            summary: typeof data.summary === 'string' ? data.summary : undefined,
+            durationMs: typeof data.duration_ms === 'number' ? data.duration_ms : undefined,
+            metrics: typeof data.metrics === 'object' && data.metrics !== null
+              ? data.metrics as Record<string, unknown>
+              : {},
+            timestamp: new Date().toISOString()
+          }];
         }
 
-        pendingThinkingQueue.push({
-          type: 'thinking',
-          content: message,
-          timestamp: new Date().toISOString()
+        updateAssistantMessage(assistantContent, thinkingForMessage);
+      };
+
+      const completeThinking = () => {
+        thinkingForMessage = thinkingForMessage.map(item => item.state === 'running'
+          ? { ...item, state: 'completed' }
+          : item);
+        updateAssistantMessage(assistantContent, thinkingForMessage);
+      };
+
+      const finalizeAssistantMessage = (finalContent?: string) => {
+        if (typeof finalContent === 'string' && finalContent.trim()) {
+          assistantContent = finalContent;
+        }
+
+        thinkingForMessage = thinkingForMessage.map(item => item.state === 'running'
+          ? { ...item, state: 'completed' }
+          : item);
+        assistantContent = normalizeCitationsForDisplay(
+          repairCollapsedMarkdownTables(assistantContent)
+        );
+        didFinalize = true;
+
+        updateSessionMessages(sessionId, prev => {
+          const newMessages = [...prev];
+          const lastMsg = newMessages[newMessages.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            newMessages[newMessages.length - 1] = {
+              ...lastMsg,
+              content: assistantContent,
+              thinking: [...thinkingForMessage],
+              thinkingCollapsed: true
+            };
+          }
+          return newMessages;
         });
-
-        if (!thinkingFlushTask) {
-          thinkingFlushTask = (async () => {
-            while (pendingThinkingQueue.length > 0) {
-              const next = pendingThinkingQueue.shift();
-              if (!next) break;
-              thinkingForMessage.push(next);
-              updateAssistantMessage(assistantContent, thinkingForMessage);
-              await sleep(280);
-            }
-            thinkingFlushTask = null;
-          })();
-        }
       };
 
       const handleSsePayload = async (payload: string) => {
@@ -468,42 +700,42 @@ function App() {
         const data = JSON.parse(payload);
 
         if (data.type === 'thinking') {
-          enqueueThinking(data.message);
+          upsertThinking(data);
+        } else if (data.type === 'thinking_done') {
+          completeThinking();
         } else if (data.type === 'text') {
           assistantContent += data.content;
           updateAssistantMessage(assistantContent, thinkingForMessage);
-        } else if (data.type === 'done') {
-          if (thinkingFlushTask) {
-            await thinkingFlushTask;
-          }
-
-          if (typeof data.content === 'string' && data.content.trim()) {
-            assistantContent = data.content;
-          }
-
-          assistantContent = normalizeCitationsForDisplay(assistantContent);
+        } else if (data.type === 'answer_reset') {
+          assistantContent = '';
           updateAssistantMessage(assistantContent, thinkingForMessage);
-
-          setTimeout(() => {
-            setMessages(prev => {
-              const newMessages = [...prev];
-              const lastMsg = newMessages[newMessages.length - 1];
-              if (lastMsg && lastMsg.role === 'assistant') {
-                lastMsg.thinkingCollapsed = true;
-              }
-              return newMessages;
-            });
-          }, 2000);
+        } else if (data.type === 'done') {
+          finalizeAssistantMessage(
+            typeof data.content === 'string' ? data.content : undefined
+          );
+        } else if (data.type === 'stopped') {
+          upsertThinking({
+            id: `stopped-${sessionId}`,
+            kind: 'status',
+            state: 'completed',
+            message: data.message || '任务已停止'
+          });
+          finalizeAssistantMessage(assistantContent || '任务已停止。');
         } else if (data.type === 'error') {
+          upsertThinking({
+            id: `error-${++activitySequence}`,
+            kind: 'status',
+            state: 'error',
+            message: data.message || '处理请求时发生错误'
+          });
           throw new Error(data.message);
         }
       };
 
       if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
+        let chunk = await reader.read();
+        while (!chunk.done) {
+          const { value } = chunk;
           sseBuffer += decoder.decode(value, { stream: true });
           const rawEvents = sseBuffer.split('\n\n');
           sseBuffer = rawEvents.pop() || '';
@@ -522,6 +754,7 @@ function App() {
               console.error('Error parsing SSE data:', e);
             }
           }
+          chunk = await reader.read();
         }
 
         // Flush any trailing SSE payload still in the buffer
@@ -533,25 +766,58 @@ function App() {
             console.error('Error parsing trailing SSE data:', e);
           }
         }
+
+        if (!didFinalize) {
+          finalizeAssistantMessage();
+        }
       }
     } catch (error) {
-      console.error('Failed to send message:', error);
+      const wasAborted = error instanceof DOMException && error.name === 'AbortError';
+      if (!wasAborted) console.error('Failed to send message:', error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      setMessages(prev => {
+      updateSessionMessages(sessionId, prev => {
         const newMessages = [...prev];
         const lastMsg = newMessages[newMessages.length - 1];
-        if (lastMsg && lastMsg.role === 'assistant' && lastMsg.content === '') {
-          lastMsg.content = `请求失败：${errMsg}`;
+        if (lastMsg && lastMsg.role === 'assistant') {
+          if (wasAborted) {
+            lastMsg.content = lastMsg.content || '任务已停止。';
+            lastMsg.thinkingCollapsed = true;
+          } else if (lastMsg.content === '') {
+            lastMsg.content = `请求失败：${errMsg}`;
+          }
         }
         return newMessages;
       });
     } finally {
-      setIsLoading(false);
+      if (abortControllersRef.current.get(sessionId) === abortController) {
+        abortControllersRef.current.delete(sessionId);
+      }
+      setLoadingSessionIds(previous => {
+        const next = new Set(previous);
+        next.delete(sessionId);
+        return next;
+      });
     }
+  };
+
+  const stopCurrentTask = async () => {
+    const sessionId = currentSessionId;
+    if (!sessionId || !loadingSessionIds.has(sessionId)) return;
+
+    const stopRequest = apiService.stopThread(sessionId).catch(error => {
+      console.error('Failed to stop backend task:', error);
+    });
+    abortControllersRef.current.get(sessionId)?.abort();
+    await stopRequest;
   };
 
   const handleExampleQuery = (query: string) => {
     setInputValue(query);
+  };
+
+  const setCurrentSessionOntology = (enabled: boolean) => {
+    if (!currentSessionId) return;
+    setSessionOntologyModes(previous => new Map(previous).set(currentSessionId, enabled));
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -585,6 +851,27 @@ function App() {
             </button>
           </div>
 
+          {!sidebarCollapsed && (
+            <div className="nav-section">
+              <div className="nav-section-title">Session Settings</div>
+              <label className="session-toggle-row">
+                <span className="session-toggle-label">Ontology</span>
+                <input
+                  className="session-toggle-input"
+                  type="checkbox"
+                  role="switch"
+                  checked={ontologyEnabled}
+                  disabled={!currentSessionId}
+                  onChange={(event) => setCurrentSessionOntology(event.target.checked)}
+                  aria-label="Enable ontology for this session"
+                />
+                <span className="session-toggle-track" aria-hidden="true">
+                  <span className="session-toggle-thumb" />
+                </span>
+              </label>
+            </div>
+          )}
+
           {/* Current Chat Section */}
           <div className="nav-section">
             <div className="nav-section-title">Active Session</div>
@@ -605,7 +892,7 @@ function App() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
                   <span className="nav-icon">💬</span>
                   <span className="nav-text" style={{ fontSize: '13px' }}>
-                    {session.name}
+                    {session.name}{loadingSessionIds.has(session.id) ? ' · Running' : ''}
                   </span>
                 </div>
                 <span
@@ -668,6 +955,15 @@ function App() {
           <div className="chat-title">
             {currentSessionId ? `Session: ${currentSessionId.substring(0, 20)}...` : 'MAF Data Insight Agent'}
           </div>
+          <div className="header-actions">
+            <button
+              className="icon-btn"
+              onClick={openBusinessLayer}
+              title="Workspace business semantics shared by every session"
+            >
+              📘 Business Layer Doc
+            </button>
+          </div>
         </div>
 
         {(
@@ -704,28 +1000,11 @@ function App() {
                         <>
                           {/* Thinking section - always present, collapsible */}
                           {msg.thinking && msg.thinking.length > 0 && (
-                            <div className="thinking-container">
-                              <button 
-                                className="thinking-toggle"
-                                onClick={() => toggleThinking(idx)}
-                              >
-                                <span className="thinking-icon">
-                                  {msg.thinkingCollapsed ? '▶' : '▼'}
-                                </span>
-                                <span className="thinking-title">
-                                  思考过程 ({msg.thinking.length} steps)
-                                </span>
-                              </button>
-                              {!msg.thinkingCollapsed && (
-                                <div className="thinking-content">
-                                  {msg.thinking.map((thinking, tIdx) => (
-                                    <div key={tIdx} className="thinking-step">
-                                      {thinking.content}
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
+                            <ActivityPanel
+                              key={`activity-${idx}-${msg.thinkingCollapsed ? 'complete' : 'active'}`}
+                              activities={msg.thinking}
+                              complete={Boolean(msg.thinkingCollapsed)}
+                            />
                           )}
                           
                           {/* Assistant response */}
@@ -735,6 +1014,7 @@ function App() {
                               urlTransform={(url) => url}
                               components={{
                                 a: ({ href, node, children, ...props }) => {
+                                  void node;
                                   const childArr = React.Children.toArray(children);
                                   const onlyImg =
                                     childArr.length === 1 &&
@@ -756,7 +1036,7 @@ function App() {
                                 img: ({ src, alt }) => <ProxiedImage src={src} alt={alt} />
                               }}
                             >
-                              {msg.content}
+                              {repairCollapsedMarkdownTables(msg.content)}
                             </ReactMarkdown>
                             <span className="message-timestamp">
                               {new Date(msg.timestamp).toLocaleTimeString()}
@@ -788,17 +1068,47 @@ function App() {
                   disabled={isLoading}
                 />
                 <button
-                  className="send-btn"
-                  onClick={sendMessageStream}
-                  disabled={isLoading || !inputValue.trim()}
+                  className={`send-btn ${isLoading ? 'stop' : ''}`}
+                  onClick={isLoading ? stopCurrentTask : sendMessageStream}
+                  disabled={!isLoading && !inputValue.trim()}
+                  title={isLoading ? '停止当前 Session 的任务' : '发送消息'}
                 >
-                  {isLoading ? 'Sending...' : 'Send 🚀'}
+                  {isLoading ? '■ Stop' : 'Send'}
                 </button>
               </div>
             </div>
         </>
         )}
       </div>
+
+      {businessLayerOpen && (
+        <div className="business-layer-overlay" onClick={() => setBusinessLayerOpen(false)}>
+          <div className="business-layer-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="business-layer-header">
+              <div className="business-layer-title">📘 Business Layer Doc</div>
+              <button className="icon-btn" onClick={() => setBusinessLayerOpen(false)}>✕</button>
+            </div>
+            <div className="business-layer-hint">
+              Describe your business semantics — terminology, metric definitions, and reporting rules.
+              It is shared by the whole workspace and given to the analysis agent with every question,
+              whether Ontology is on or off. Verified Databricks schema always takes precedence.
+            </div>
+            <textarea
+              className="business-layer-textarea"
+              value={businessLayerDraft}
+              onChange={(e) => setBusinessLayerDraft(e.target.value)}
+              disabled={businessLayerBusy}
+              placeholder={'# Terminology\n- VIP customer = a customer whose yearly spend exceeds the agreed threshold\n\n# Metric definitions\n- Revenue = sum of order totals'}
+            />
+            <div className="business-layer-footer">
+              <span className="business-layer-status">{businessLayerStatus}</span>
+              <button className="icon-btn" onClick={persistBusinessLayer} disabled={businessLayerBusy}>
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

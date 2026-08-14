@@ -19,13 +19,22 @@ export interface SessionInfo {
   message_count: number;
 }
 
-export interface ChatRequest {
-  message: string;
-  thread_id?: string;
+export interface ThreadSummary {
+  id: string;
+  message_count: number;
+  last_updated: string;
 }
 
-export interface ChatResponse {
-  response: string;
-  thread_id: string;
-  timestamp: string;
+export interface RuntimeConfig {
+  default_enable_ontology: boolean;
+  ontology: {
+    available: boolean;
+    reasoner_enabled?: boolean;
+    reasoner?: string;
+    reasoning_status: string;
+    reasoning_error?: string | null;
+    file_count?: number;
+    ontology_count?: number;
+    entity_count?: number;
+  };
 }

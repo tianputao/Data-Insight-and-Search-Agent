@@ -6,7 +6,6 @@
 #   ./run.sh            Start the full stack (FastAPI + React)
 #   ./run.sh backend    Start only the FastAPI backend
 #   ./run.sh frontend   Start only the React frontend
-#   ./run.sh streamlit  Start the standalone Streamlit UI (RAG only)
 #   ./run.sh install    Install Python and Node.js dependencies
 # ============================================================
 
@@ -17,8 +16,19 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_ROOT}/venv"
 FRONTEND_DIR="${PROJECT_ROOT}/frontend"
 ENV_FILE="${PROJECT_ROOT}/.env"
-BACKEND_PORT="${BACKEND_PORT:-8000}"
-FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+
+read_numeric_env() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "${ENV_FILE}" ]]; then
+    value="$(sed -n "s/^${key}=\([0-9][0-9]*\).*$/\1/p" "${ENV_FILE}" | tail -n1)"
+  fi
+  printf '%s' "${value:-${fallback}}"
+}
+
+BACKEND_PORT="${BACKEND_PORT:-$(read_numeric_env BACKEND_PORT 8000)}"
+FRONTEND_PORT="${FRONTEND_PORT:-$(read_numeric_env FRONTEND_PORT 3000)}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
@@ -119,12 +129,6 @@ start_backend() {
     exit 1
   fi
 
-  # Export .env into the shell so uvicorn picks up the variables
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
-  set +a
-
   exec uvicorn src.api.main:app \
     --host 0.0.0.0 \
     --port "${BACKEND_PORT}" \
@@ -136,21 +140,7 @@ start_frontend() {
   info "Starting React frontend on port ${FRONTEND_PORT}…"
   cd "${FRONTEND_DIR}"
   export VITE_API_BASE_URL="/api"
-  exec npm run dev -- --port "${FRONTEND_PORT}"
-}
-
-start_streamlit() {
-  info "Starting standalone Streamlit UI (RAG/search only)…"
-  cd "${PROJECT_ROOT}"
-  activate_venv
-  check_env
-
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
-  set +a
-
-  exec streamlit run app.py --server.port 8501 --server.headless true
+  exec npm run dev -- --port "${FRONTEND_PORT}" --strictPort
 }
 
 start_full_stack() {
@@ -199,10 +189,6 @@ start_full_stack() {
     (
       cd "${PROJECT_ROOT}"
       activate_venv
-      set -a
-      # shellcheck source=/dev/null
-      source "${ENV_FILE}"
-      set +a
       uvicorn src.api.main:app \
         --host 0.0.0.0 \
         --port "${BACKEND_PORT}" \
@@ -241,7 +227,7 @@ start_full_stack() {
   (
     cd "${FRONTEND_DIR}"
     VITE_API_BASE_URL="/api" \
-    npm run dev -- --port "${FRONTEND_PORT}"
+    npm run dev -- --port "${FRONTEND_PORT}" --strictPort
   ) &
   FRONTEND_PID=$!
 
@@ -290,9 +276,6 @@ case "${MODE}" in
   frontend)
     start_frontend
     ;;
-  streamlit)
-    start_streamlit
-    ;;
   install)
     install_python_deps
     install_node_deps
@@ -302,7 +285,7 @@ case "${MODE}" in
     start_full_stack
     ;;
   *)
-    echo "Usage: $0 [backend|frontend|streamlit|install|full]"
+    echo "Usage: $0 [backend|frontend|install|full]"
     exit 1
     ;;
 esac

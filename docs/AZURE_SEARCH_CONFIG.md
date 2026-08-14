@@ -111,7 +111,7 @@ Create a semantic configuration named `default` on your index (or set `AZURE_SEA
 }
 ```
 
-Semantic reranking is toggled at runtime via `DEFAULT_ENABLE_SEMANTIC_RERANKER` (default `true`). When enabled, the search tool sets `query_type = QueryType.SEMANTIC` and passes `semantic_configuration_name`.
+Semantic reranking is configured at backend startup via `DEFAULT_ENABLE_SEMANTIC_RERANKER` (default `true`). When enabled, the search tool sets `query_type = QueryType.SEMANTIC` and passes `semantic_configuration_name`. Restart after changing the environment value.
 
 ### Vector Search
 
@@ -140,11 +140,11 @@ The index must have an HNSW vector search algorithm and a profile named `vectorS
 }
 ```
 
-The search tool constructs a `VectorizedQuery` over `contentVector` with `k=50` candidates before reranking, then returns the top `DEFAULT_TOP_K` results (default `20`).
+The low-level search tool constructs a `VectorizedQuery` over `contentVector` with `k=50`. SearchAgent requests 20 candidates, applies relevance filtering/deduplication, and returns at most the tool call's `top_k` value (default `10`).
 
 ### Agentic Retrieval
 
-When `DEFAULT_ENABLE_AGENTIC_RETRIEVAL=true`, the search tool uses Azure AI Search's built-in agentic retrieval API instead of the standard hybrid path. Toggle via `.env` or at runtime from the frontend.
+When `DEFAULT_ENABLE_AGENTIC_RETRIEVAL=true`, the search tool uses Azure AI Search's built-in agentic retrieval API instead of the standard hybrid path. Configure it in `.env` and restart the backend; the current frontend does not expose a per-request switch.
 
 ---
 
@@ -154,8 +154,8 @@ The search tool automatically appends a SAS token to document and image URLs:
 
 | Config variable | Purpose |
 |---|---|
-| `BASE_URL` | Base URL of the blob container holding indexed documents |
-| `SAS_TOKEN` | SAS token appended to `filepath`-based citation URLs |
+| `AZURE_BLOB_BASE_URL` | Base URL of the blob container holding indexed documents |
+| `AZURE_BLOB_SAS_TOKEN` | SAS token appended to `filepath`-based citation URLs |
 | `AZURE_IMAGE_BASE_URL` | Base URL of the blob container holding document images |
 | `AZURE_IMAGE_SAS_TOKEN` | SAS token for image URLs extracted from `image_mapping` |
 
@@ -231,5 +231,5 @@ No source code changes are needed for field name overrides.
 |---------|---------|-----|
 | Using `text-embedding-ada-002` (1536d) with this index | `VectorizedQuery` dimension mismatch error | Set `AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large` and `AZURE_OPENAI_EMBEDDING_DIMENSIONS=3072` |
 | Wrong `AZURE_SEARCH_VECTOR_FIELD` value | Vector search silently skipped | Verify field name matches the index schema exactly (default: `contentVector`) |
-| Expired `SAS_TOKEN` | Citation links return 403 / documents show as "Internal Document" | Regenerate SAS token and update `.env` |
+| Expired `AZURE_BLOB_SAS_TOKEN` | Citation links return 403 / documents show as "Internal Document" | Regenerate the SAS token and update `.env` |
 | Missing semantic configuration | `SemanticConfigurationNotFound` error | Create a semantic config named `default` in the Azure portal or set `AZURE_SEARCH_SEMANTIC_CONFIG` to an existing config name |

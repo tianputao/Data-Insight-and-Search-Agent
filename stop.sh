@@ -38,8 +38,8 @@ echo "🔎 Remaining related processes:"
 pgrep -af "uvicorn|run.sh|vite|src.api.main|npm.*dev|node.*vite" || echo "(none)"
 
 echo
-echo "🔌 Port check (8000/3000/5173):"
-ss -ltnp | grep -E ':8000|:3000|:5173' || echo "(all clear)"
+echo "🔌 Port check (8000/3000/3001/3002/5173):"
+ss -ltnp | grep -E ':8000|:3000|:3001|:3002|:5173' || echo "(all clear)"
 
 echo
 echo "✅ stop.sh finished"

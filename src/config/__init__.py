@@ -1,10 +1,12 @@
 """Configuration package."""
 
 from .settings import (
+    AgentReasoningConfig,
     AzureOpenAIConfig,
     AzureSearchConfig,
     AzureAIFoundryConfig,
     DatabricksConfig,
+    OntologyConfig,
     AppConfig,
     validate_config,
     get_search_field_config,
@@ -12,10 +14,12 @@ from .settings import (
 )
 
 __all__ = [
+    'AgentReasoningConfig',
     'AzureOpenAIConfig',
     'AzureSearchConfig',
     'AzureAIFoundryConfig',
     'DatabricksConfig',
+    'OntologyConfig',
     'AppConfig',
     'validate_config',
     'get_search_field_config',

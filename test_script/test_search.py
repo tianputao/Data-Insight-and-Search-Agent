@@ -4,7 +4,6 @@ Quick test script to verify search functionality after code fix.
 """
 
 import asyncio
-import sys
 from src.tools.ai_search_tool import AzureAISearchTool
 from src.utils import get_logger
 
