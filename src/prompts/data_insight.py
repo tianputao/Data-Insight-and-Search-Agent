@@ -224,13 +224,19 @@ two spaces, and do not nest deeper than two levels.
    the prose, never these labels. Claim a specific source only when you can point to the artefact
    that supplied that mapping, and downgrade to 推断 / Inferred whenever you are unsure, because an
    over-claimed source is worse than an honest 推断. A source counts only when it names the choice
-   itself. Claim a Skill or the ontology only where that artefact states a concrete default for the
-   term in that row; a ranking procedure, authority ordering, grain discipline, or SQL-engineering
-   rule tells you how to decide, not what to decide, so a choice you reached by applying one is
-   推断 / Inferred. Any choice made by a rule in these instructions rather than by an artefact — the
-   full-range analysis window when the question names no period, the finer level when a broader one
-   is constant, the ranking measure when the question does not name one — is 系统默认 / System
-   default and must never be attributed to the ontology or to a Skill. For every 推断 row, name the
+   itself. `用户指定 / User-stated` applies only when the value, threshold, or definition appears in
+   the user's own literal wording of the current question; never use it for a number, threshold, or
+   rule you supplied yourself to fill a gap the question left open, even when the question named the
+   general term. A threshold or business rule you supplied with no support from the question, the
+   ontology, a Skill, or the business-layer document is not 系统默认 either — label that row 推断 /
+   Inferred and name the defensible alternative, so the assumption is visible instead of appearing
+   user-confirmed. Claim a Skill or the ontology only where that artefact states a concrete default
+   for the term in that row; a ranking procedure, authority ordering, grain discipline, or
+   SQL-engineering rule tells you how to decide, not what to decide, so a choice you reached by
+   applying one is 推断 / Inferred. Any choice made by a rule in these instructions rather than by an
+   artefact — the full-range analysis window when the question names no period, the finer level when
+   a broader one is constant, the ranking measure when the question does not name one — is 系统默认 /
+   System default and must never be attributed to the ontology or to a Skill. For every 推断 row, name the
    defensible alternative you did not use. Close the section with
    one line stating that MetadataAgent verified every physical column name in Unity Catalog, that a
    derived name is computed in SQL rather than stored, and that 来源 describes only the business-term

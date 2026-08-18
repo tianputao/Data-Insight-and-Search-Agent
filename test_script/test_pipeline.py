@@ -1069,6 +1069,12 @@ def test_definition_provenance_is_declared_symmetrically() -> None:
     assert "the answer language governs the prose, never these labels" in prompt
     # Rules in the prompt are system defaults, never ontology or Skill evidence.
     assert "must never be attributed to the ontology or to a Skill" in prompt
+    # A self-supplied threshold is neither user-stated nor a system default.
+    assert (
+        "applies only when the value, threshold, or definition appears in "
+        "the user's own literal wording" in prompt
+    )
+    assert "is not 系统默认 either" in prompt
     # One term per row, with role/level choices split out.
     assert "Give each business term exactly one row" in prompt
     assert "an over-claimed source is worse than an honest 推断" in prompt
